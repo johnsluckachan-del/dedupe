@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from dedupe.cli import main, parse_args, run_dedupe
+from dedupe.cli import build_parser, main, parse_args, run_dedupe
 
 
 class TestCLI(unittest.TestCase):
@@ -81,6 +81,13 @@ class TestCLI(unittest.TestCase):
         with patch("sys.stdout", new_callable=io.StringIO):
             ret = main([str(self.root), "--dry-run", "--min-match", "8"])
             self.assertEqual(ret, 0)
+
+
+    def test_format_help(self):
+        parser = build_parser()
+        help_text = parser.format_help()
+        self.assertIn("%LOCALAPPDATA%\\dedupe\\cache", help_text)
+        self.assertIn("--cache-dir", help_text)
 
 
 if __name__ == "__main__":

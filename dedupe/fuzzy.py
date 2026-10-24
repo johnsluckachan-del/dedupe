@@ -56,9 +56,11 @@ def strip_copy_markers(stem: str) -> str:
 
 
 def normalize_stem(stem: str) -> str:
-    """Normalize stem: lowercase, strip copy markers, collapse spaces/underscores/hyphens."""
+    """Normalize stem: lowercase, strip copy markers, collapse runs of 3+ identical
+    characters, collapse spaces/underscores/hyphens."""
     s = stem.lower()
     s = strip_copy_markers(s)
+    s = re.sub(r"(.)\1{2,}", r"\1", s)
     s = re.sub(r"[\s_\-]+", " ", s).strip()
     return s
 
@@ -211,6 +213,10 @@ def run_fuzzy_pass(
                         is_dir=False,
                     )
                 )
+                if progress is not None:
+                    progress.note_duplicate()
                 trash_manager.remove_file(fp)
 
+    if progress is not None:
+        progress.end_pass("fuzzy")
     return removals, fuzzy_removed

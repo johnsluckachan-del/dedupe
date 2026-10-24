@@ -67,7 +67,8 @@ class ProgressReporter:
         self.files_found = 0
         self.total_bytes = 0
         self.files_hashed = 0
-        self.current_pass = "scanning"
+        self.duplicates_found = 0
+        self.current_pass = "walk"
         self._overwrote = False
 
     @property
@@ -94,9 +95,20 @@ class ProgressReporter:
             return
         self._write(f"Scanning {path} ...\n")
 
+    def _format_status(self) -> str:
+        return (
+            f"[{self.current_pass}] {self.files_found:,} files scanned, "
+            f"{self.duplicates_found:,} duplicates found"
+        )
+
     def set_pass(self, name: str) -> None:
         self.current_pass = name
         self.maybe_status()
+
+    def end_pass(self, name: str | None = None) -> None:
+        if name is not None:
+            self.current_pass = name
+        self.maybe_status(force=True)
 
     def note_file(self, size: int = 0) -> None:
         self.files_found += 1
@@ -107,6 +119,13 @@ class ProgressReporter:
         self.files_hashed += 1
         self.maybe_status()
 
+    def note_duplicate(self, count: int = 1) -> None:
+        self.duplicates_found += count
+        self.maybe_status()
+
+    def add_duplicates(self, count: int = 1) -> None:
+        self.note_duplicate(count)
+
     def maybe_status(self, force: bool = False) -> None:
         if self.quiet:
             return
@@ -114,23 +133,17 @@ class ProgressReporter:
         if not force and (now - self._last_status) < self.interval:
             return
         self._last_status = now
-        line = (
-            f"Progress: {self.files_found} files found, {self.total_bytes} bytes, "
-            f"pass: {self.current_pass}, {self.files_hashed} files hashed"
-        )
-        if self._is_tty():
-            self._overwrote = True
-            self._write(f"\r{line}")
-        else:
-            self._write(line + "\n")
+        self._write(self._format_status() + "\n")
 
     def done(self) -> None:
         if self.quiet:
             return
         elapsed = time.monotonic() - self.start_time
-        prefix = "\n" if self._overwrote else ""
         self._overwrote = False
-        self._write(f"{prefix}Done in {elapsed:.2f}s\n")
+        self._write(
+            f"Done in {elapsed:.2f}s: {self.files_found:,} files scanned, "
+            f"{self.duplicates_found:,} duplicates found\n"
+        )
 
 
 @dataclass
@@ -160,7 +173,7 @@ def build_inventory(root: Path, progress: Optional[ProgressReporter] = None) -> 
     files: List[FileInfo] = []
     dirs: List[Path] = []
     if progress is not None:
-        progress.current_pass = "scanning"
+        progress.current_pass = "walk"
     for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
         dirnames[:] = [
             d
@@ -188,6 +201,7 @@ def build_inventory(root: Path, progress: Optional[ProgressReporter] = None) -> 
         # Inventory totals are authoritative even if no status line was emitted.
         progress.files_found = len(files)
         progress.total_bytes = inv.total_bytes
+        progress.end_pass("walk")
     return inv
 
 

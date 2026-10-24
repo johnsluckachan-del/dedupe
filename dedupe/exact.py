@@ -121,6 +121,10 @@ def run_exact_pass(
                         is_dir=False,
                     )
                 )
+                if progress is not None:
+                    progress.note_duplicate()
                 trash_manager.remove_file(fp)
 
+    if progress is not None:
+        progress.end_pass("exact")
     return removals, removed_files

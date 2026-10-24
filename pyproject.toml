@@ -10,5 +10,14 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = []
 
+# The similar pass (near-duplicate images and documents) works without these;
+# images need Pillow and PDF text needs pypdf, and each is skipped with one
+# stderr warning when it is missing. Everything else is stdlib.
+[project.optional-dependencies]
+similar = [
+    "Pillow",
+    "pypdf",
+]
+
 [project.scripts]
 dedupe = "dedupe.cli:main"

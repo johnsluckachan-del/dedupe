@@ -267,4 +267,8 @@ def main(argv: List[str] | None = None) -> int:
         threshold=args.threshold,
         min_match=args.min_match,
         quiet=args.quiet,
+        no_similar=args.no_similar,
+        review=args.review,
+        image_distance=args.image_distance,
+        text_similarity=args.text_similarity,
     )

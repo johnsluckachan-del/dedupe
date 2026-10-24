@@ -168,7 +168,15 @@ def _read_plain_text(path: Path) -> Optional[str]:
 
 
 def _read_docx_text(path: Path) -> Optional[str]:
-    """Pull the body text out of word/document.xml with the stdlib only."""
+    """Pull the body text out of word/document.xml with the stdlib only.
+
+    The pieces are concatenated with no separator: WordprocessingML carries no
+    implied whitespace between runs, and a writer may split a single sentence
+    (even a single word) across runs and paragraphs at arbitrary points. Joining
+    with a space would invent word breaks there, and because two edits of the
+    same document split at different offsets the invented breaks would differ,
+    which wrecks the shingle overlap the comparison relies on.
+    """
     try:
         with zipfile.ZipFile(path) as zf:
             try:
@@ -191,7 +199,7 @@ def _read_docx_text(path: Path) -> Optional[str]:
         length += len(text)
         if length >= MAX_TEXT_BYTES:
             break
-    return " ".join(parts)
+    return "".join(parts)
 
 
 def _read_pdf_text(path: Path) -> Optional[str]:

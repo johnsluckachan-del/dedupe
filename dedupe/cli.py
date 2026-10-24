@@ -14,6 +14,7 @@ from dedupe.fuzzy import run_fuzzy_pass
 from dedupe.similar import (
     DEFAULT_IMAGE_DISTANCE,
     DEFAULT_TEXT_SIMILARITY,
+    DEFAULT_VIDEO_DISTANCE,
     SimilarMatch,
     run_similar_pass,
 )
@@ -84,6 +85,12 @@ def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
         help=f"Min shingle Jaccard for similar documents (default: {DEFAULT_TEXT_SIMILARITY})",
     )
     parser.add_argument(
+        "--video-distance",
+        type=int,
+        default=DEFAULT_VIDEO_DISTANCE,
+        help=f"Max per-frame dHash Hamming distance for similar videos (default: {DEFAULT_VIDEO_DISTANCE})",
+    )
+    parser.add_argument(
         "--quiet",
         action="store_true",
         help="Suppress progress output on stderr",
@@ -103,6 +110,7 @@ def run_dedupe(
     review: bool = False,
     image_distance: int = DEFAULT_IMAGE_DISTANCE,
     text_similarity: float = DEFAULT_TEXT_SIMILARITY,
+    video_distance: int = DEFAULT_VIDEO_DISTANCE,
 ) -> int:
     progress = ProgressReporter(quiet=quiet)
     progress.start(target_path)
@@ -197,6 +205,7 @@ def run_dedupe(
                 review=review,
                 image_distance=image_distance,
                 text_similarity=text_similarity,
+                video_distance=video_distance,
                 inventory=inventory,
                 progress=progress,
                 quiet=quiet,
@@ -237,9 +246,11 @@ def run_dedupe(
     video_summary_extra = f", {video_count} video-name, {sample_count} sample, {leftover_count} torrent-leftover" if (video_count or sample_count or leftover_count) else ""
     similar_image_count = sum(1 for r in all_removals if r.reason == "similar-image")
     similar_doc_count = sum(1 for r in all_removals if r.reason == "similar-document")
+    similar_video_count = sum(1 for r in all_removals if r.reason == "similar-video")
     similar_summary_extra = (
         f", {similar_image_count} similar-image, {similar_doc_count} similar-document"
-        if (similar_image_count or similar_doc_count)
+        f", {similar_video_count} similar-video"
+        if (similar_image_count or similar_doc_count or similar_video_count)
         else ""
     )
     total_count = len(all_removals)
@@ -271,4 +282,5 @@ def main(argv: List[str] | None = None) -> int:
         review=args.review,
         image_distance=args.image_distance,
         text_similarity=args.text_similarity,
+        video_distance=args.video_distance,
     )

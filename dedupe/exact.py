@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -16,7 +17,29 @@ from dedupe.core import (
     is_symlink_or_junction,
 )
 
-__all__ = ["exact_keeper_key", "run_exact_pass", "is_symlink_or_junction", "hash_file"]
+__all__ = ["exact_keeper_key", "run_exact_pass", "is_symlink_or_junction", "hash_file", "quick_fingerprint"]
+
+# Files this size or bigger get a cheap fingerprint before the full SHA-256,
+# so a same-size pair that differs can be ruled out without reading the
+# whole file over a network share.
+QUICK_FINGERPRINT_MIN_SIZE = 8 * 1024 * 1024
+_FINGERPRINT_CHUNK = 1024 * 1024
+
+
+def quick_fingerprint(path: Path, size: int) -> Optional[str]:
+    """blake2b over the first, middle and last 1 MiB of a file, or None on error."""
+    try:
+        h = hashlib.blake2b()
+        with open(path, "rb") as fh:
+            h.update(fh.read(_FINGERPRINT_CHUNK))
+            mid = max(0, size // 2 - _FINGERPRINT_CHUNK // 2)
+            fh.seek(mid)
+            h.update(fh.read(_FINGERPRINT_CHUNK))
+            fh.seek(max(0, size - _FINGERPRINT_CHUNK))
+            h.update(fh.read(_FINGERPRINT_CHUNK))
+    except OSError:
+        return None
+    return h.hexdigest()
 
 
 def exact_keeper_key(root: Path, p: Path) -> Tuple[int, str, float, int, str]:
@@ -93,15 +116,30 @@ def run_exact_pass(
                 continue
             block_groups.setdefault(head, []).append(fp)
 
+        is_big = size >= QUICK_FINGERPRINT_MIN_SIZE
         hash_groups: Dict[str, List[Path]] = {}
         for head_files in block_groups.values():
             if len(head_files) < 2:
                 continue
-            for fp in head_files:
-                digest = hash_cache.get(fp)
-                if digest is None:
-                    continue
-                hash_groups.setdefault(digest, []).append(fp)
+            if is_big:
+                # Second pre-filter for big files: a cheap fingerprint over
+                # three 1 MiB slices rules out most differing files without
+                # a full SHA-256 over a multi-GB video.
+                fingerprint_groups: Dict[str, List[Path]] = {}
+                for fp in head_files:
+                    fingerprint = quick_fingerprint(fp, size)
+                    if fingerprint is None:
+                        continue
+                    fingerprint_groups.setdefault(fingerprint, []).append(fp)
+                candidate_groups = [g for g in fingerprint_groups.values() if len(g) >= 2]
+            else:
+                candidate_groups = [head_files]
+            for group_files in candidate_groups:
+                for fp in group_files:
+                    digest = hash_cache.get(fp)
+                    if digest is None:
+                        continue
+                    hash_groups.setdefault(digest, []).append(fp)
 
         for matching_files in hash_groups.values():
             if len(matching_files) < 2:

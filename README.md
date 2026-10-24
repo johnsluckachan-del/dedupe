@@ -1,11 +1,11 @@
 # dedupe
 
-A command-line tool to scan a folder recursively and safely remove duplicate folders, exact duplicate files, fuzzy-name duplicate files, torrent video duplicates, and near-duplicate images and documents. Built with the Python 3.12 standard library; only the near-duplicate image/PDF readers are optional third-party extras, and everything runs on this PC with no network use.
+A command-line tool to scan a folder recursively and safely remove duplicate folders, exact duplicate files, fuzzy-name duplicate files, torrent video duplicates, and near-duplicate images, documents and videos. Built with the Python 3.12 standard library; the near-duplicate image/PDF readers are optional third-party extras and video content similarity needs a local ffmpeg/ffprobe, and everything runs on this PC with no network use.
 
 ## Key Features
 
 - **Duplicate Folders**: Identifies non-empty folders whose entire recursive structure and SHA-256 file contents match. Only top-most matching folders are removed whole.
-- **Exact Duplicate Files**: Scans the whole tree for identical files by size and chunked SHA-256 hashes (skipping zero-byte files).
+- **Exact Duplicate Files**: Scans the whole tree for identical files by size and chunked SHA-256 hashes (skipping zero-byte files). Same-size files of 8 MiB or more first get a cheap blake2b fingerprint (first, middle and last 1 MiB); only files whose fingerprint matches get the full SHA-256, so a multi-GB video that turns out to differ is never read in full.
 - **Fuzzy-Name Duplicate Files**: Identifies copy-named variants (e.g. `report (1).docx`, `Copy of budget.xlsx`, `file - Copy.docx`) and files sharing $N+$ common characters within the same folder and same extension using stem normalization, `difflib.SequenceMatcher` ratio, and longest common contiguous substring matching (`--min-match`).
 - **Numbered Sequence Protection**: Excludes files that differ only in numbers/digits (e.g. `IMG_0001.jpg` vs `IMG_0002.jpg`, `chapter-1.md` vs `chapter-2.md`).
 - **Safety First**:
@@ -44,6 +44,7 @@ usage: dedupe [-h] [--dry-run] [--permanent] [--no-fuzzy] [--quiet]
               [--threshold THRESHOLD] [--min-match MIN_MATCH]
               [--no-similar] [--review] [--delete-similar]
               [--image-distance N] [--text-similarity R]
+              [--video-distance N]
               path
 
 positional arguments:
@@ -69,6 +70,8 @@ options:
                         (default: 6)
   --text-similarity R   Min shingle Jaccard for similar documents
                         (default: 0.9)
+  --video-distance N    Max per-frame dHash Hamming distance for similar
+                        videos (default: 10)
   --quiet               Suppress progress output on stderr
 ```
 

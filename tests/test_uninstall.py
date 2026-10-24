@@ -37,12 +37,14 @@ def _run_powershell(args, cwd=None, env=None):
     )
 
 
-@unittest.skipUnless(POWERSHELL, "powershell is required for uninstall tests")
 class TestUninstallScript(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name).resolve()
         self.assertTrue(UNINSTALL_PS1.is_file(), "packaging/uninstall.ps1 missing")
+        self.assertIsNotNone(
+            POWERSHELL, "powershell is required to run packaging/uninstall.ps1"
+        )
 
     def tearDown(self):
         try:

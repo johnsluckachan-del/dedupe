@@ -50,8 +50,10 @@ __all__ = [
     "document_shingles",
     "shingle_set",
     "jaccard",
+    "ffprobe_command",
     "probe_video",
     "video_frame_hashes",
+    "frames_matching",
     "run_similar_pass",
 ]
 
@@ -106,8 +108,8 @@ class SimilarMatch:
 
     removed_path: Path
     kept_path: Path
-    kind: str  # "image" or "document"
-    score_text: str  # "distance 3", "similarity 0.95"
+    kind: str  # "image", "document" or "video"
+    score_text: str  # "distance 3", "similarity 0.95", "frames 7/7"
 
 
 # --------------------------------------------------------------------------
@@ -122,6 +124,18 @@ def _resampling_filter():
     if resampling is not None:
         return resampling.LANCZOS
     return Image.LANCZOS
+
+
+def _dhash_from_gray(data: Sequence[int]) -> Optional[int]:
+    """64-bit dHash of a 9x8 grayscale grid, or None when the grid is short."""
+    if len(data) < DHASH_WIDTH * DHASH_HEIGHT:
+        return None
+    bits = 0
+    for y in range(DHASH_HEIGHT):
+        row = y * DHASH_WIDTH
+        for x in range(DHASH_WIDTH - 1):
+            bits = (bits << 1) | (1 if data[row + x] < data[row + x + 1] else 0)
+    return bits
 
 
 def dhash_image(path: Path) -> Optional[Tuple[int, int]]:
@@ -141,13 +155,9 @@ def dhash_image(path: Path) -> Optional[Tuple[int, int]]:
             data = list(small.getdata())
     except Exception:
         return None
-    if len(data) < DHASH_WIDTH * DHASH_HEIGHT:
+    bits = _dhash_from_gray(data)
+    if bits is None:
         return None
-    bits = 0
-    for y in range(DHASH_HEIGHT):
-        row = y * DHASH_WIDTH
-        for x in range(DHASH_WIDTH - 1):
-            bits = (bits << 1) | (1 if data[row + x] < data[row + x + 1] else 0)
     return bits, pixels
 
 
@@ -174,16 +184,39 @@ def _have_ffmpeg_tools() -> bool:
     return shutil.which("ffmpeg") is not None and shutil.which("ffprobe") is not None
 
 
+def ffprobe_command(path: Path) -> List[str]:
+    """The ffprobe argv used to read one video's duration and frame size.
+
+    No ``-nostdin`` here: that option belongs to ffmpeg only, and ffprobe
+    rejects unknown options outright (exit 1, nothing on stdout), which would
+    make every video unprobeable. ``stdin=subprocess.DEVNULL`` on the call
+    gives the same guarantee of never touching the terminal.
+    """
+    return [
+        "ffprobe", "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=width,height,duration:format=duration",
+        "-of", "json", str(path),
+    ]
+
+
+def _positive_float(value) -> Optional[float]:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
+
+
 def probe_video(path: Path) -> Optional[Tuple[float, int, int]]:
-    """Return ``(duration seconds, width, height)`` via ffprobe, or None."""
+    """Return ``(duration seconds, width, height)`` via ffprobe, or None.
+
+    None means "skip this file silently": ffprobe missing, a corrupt or
+    non-video file, or a stream with no usable duration or frame size.
+    """
     try:
         proc = subprocess.run(
-            [
-                "ffprobe", "-v", "error", "-nostdin",
-                "-select_streams", "v:0",
-                "-show_entries", "stream=width,height:format=duration",
-                "-of", "json", str(path),
-            ],
+            ffprobe_command(path),
             capture_output=True, timeout=_FFMPEG_TIMEOUT, stdin=subprocess.DEVNULL,
         )
     except (OSError, subprocess.SubprocessError):
@@ -195,12 +228,17 @@ def probe_video(path: Path) -> Optional[Tuple[float, int, int]]:
         streams = data.get("streams") or []
         if not streams:
             return None
-        width = int(streams[0]["width"])
-        height = int(streams[0]["height"])
-        duration = float(data["format"]["duration"])
+        stream = streams[0]
+        width = int(stream["width"])
+        height = int(stream["height"])
     except Exception:
         return None
-    if width <= 0 or height <= 0 or duration <= 0:
+    # Container duration first; some containers (Matroska is the common one)
+    # only carry it on the stream, so fall back to that before giving up.
+    duration = _positive_float((data.get("format") or {}).get("duration"))
+    if duration is None:
+        duration = _positive_float(stream.get("duration"))
+    if duration is None or width <= 0 or height <= 0:
         return None
     return duration, width, height
 
@@ -217,7 +255,8 @@ def _grab_frame_hash(path: Path, t: float) -> Optional[int]:
             [
                 "ffmpeg", "-nostdin", "-ss", f"{t:.3f}", "-i", str(path),
                 "-frames:v", "1", "-vf", f"scale={DHASH_WIDTH}:{DHASH_HEIGHT},format=gray",
-                "-f", "rawvideo", "-",
+                # -an/-sn: nothing but the picture may reach the raw pipe.
+                "-an", "-sn", "-f", "rawvideo", "-",
             ],
             capture_output=True, timeout=_FFMPEG_TIMEOUT, stdin=subprocess.DEVNULL,
         )
@@ -225,32 +264,37 @@ def _grab_frame_hash(path: Path, t: float) -> Optional[int]:
         return None
     if proc.returncode != 0:
         return None
-    data = proc.stdout
-    if len(data) < DHASH_WIDTH * DHASH_HEIGHT:
-        return None
-    bits = 0
-    for y in range(DHASH_HEIGHT):
-        row = y * DHASH_WIDTH
-        for x in range(DHASH_WIDTH - 1):
-            bits = (bits << 1) | (1 if data[row + x] < data[row + x + 1] else 0)
-    return bits
+    # scale=9:8,format=gray over rawvideo is exactly 72 packed bytes.
+    return _dhash_from_gray(proc.stdout)
 
 
-def video_frame_hashes(path: Path, duration: float) -> Optional[List[int]]:
-    """dHash for each of ``VIDEO_FRAME_COUNT`` evenly spaced frames, or None.
+def video_frame_hashes(path: Path, duration: float) -> Optional[List[Optional[int]]]:
+    """dHash per evenly spaced frame (None for a frame that would not decode).
 
-    None means the whole video should be skipped silently: any single frame
-    grab failing (unreadable/corrupt file, seek past a truncated stream) is
-    treated as the file not being judgeable.
+    A single unreadable frame only costs that frame: it can never count as a
+    match, so a video that still yields ``VIDEO_FRAME_MATCH_NEEDED`` frames can
+    be judged. Fewer than that means the file is not judgeable at all
+    (unreadable/corrupt/truncated) and the whole video is skipped silently,
+    signalled by None.
     """
-    hashes: List[int] = []
+    hashes: List[Optional[int]] = []
     for frac in _frame_fractions():
         t = max(0.0, min(duration - 0.01, duration * frac))
-        h = _grab_frame_hash(path, t)
-        if h is None:
-            return None
-        hashes.append(h)
+        hashes.append(_grab_frame_hash(path, t))
+    if sum(1 for h in hashes if h is not None) < VIDEO_FRAME_MATCH_NEEDED:
+        return None
     return hashes
+
+
+def frames_matching(
+    a: Sequence[Optional[int]], b: Sequence[Optional[int]], distance: int
+) -> int:
+    """How many frame pairs are within ``distance`` bits of each other."""
+    return sum(
+        1
+        for ha, hb in zip(a, b)
+        if ha is not None and hb is not None and hamming_distance(ha, hb) <= distance
+    )
 
 
 def _duration_close(a: float, b: float) -> bool:
@@ -656,7 +700,7 @@ def run_similar_pass(
             )
 
     # --- Videos ----------------------------------------------------------
-    video_hashes: Dict[Path, List[int]] = {}
+    video_hashes: Dict[Path, List[Optional[int]]] = {}
     video_pixels: Dict[Path, int] = {}
     video_groups: List[List[Path]] = []
     match_count: Dict[Tuple[Path, Path], int] = {}
@@ -697,11 +741,7 @@ def run_similar_pass(
             for a, b in duration_pairs:
                 if a not in video_hashes or b not in video_hashes:
                     continue
-                n = sum(
-                    1
-                    for ha, hb in zip(video_hashes[a], video_hashes[b])
-                    if hamming_distance(ha, hb) <= video_distance
-                )
+                n = frames_matching(video_hashes[a], video_hashes[b], video_distance)
                 if n >= VIDEO_FRAME_MATCH_NEEDED:
                     match_count[(a, b)] = n
                     uf.union(index_of[a], index_of[b])
@@ -722,10 +762,8 @@ def run_similar_pass(
             if n is None:
                 n = match_count.get((keeper, fp))
             if n is None:
-                n = sum(
-                    1
-                    for ha, hb in zip(video_hashes[fp], video_hashes[keeper])
-                    if hamming_distance(ha, hb) <= video_distance
+                n = frames_matching(
+                    video_hashes[fp], video_hashes[keeper], video_distance
                 )
             matches.append(
                 SimilarMatch(

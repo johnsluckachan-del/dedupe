@@ -13,8 +13,10 @@ this pass moves.
 
 from __future__ import annotations
 
+import concurrent.futures
 import hashlib
 import importlib
+import os
 import json
 import shutil
 import subprocess
@@ -32,6 +34,7 @@ from dedupe.core import (
     TrashManager,
     build_inventory,
 )
+from dedupe.cache import ProbeCache
 from dedupe.fuzzy import UnionFind
 from dedupe.video import VIDEO_EXTENSIONS
 
@@ -42,6 +45,7 @@ __all__ = [
     "DEFAULT_IMAGE_DISTANCE",
     "DEFAULT_TEXT_SIMILARITY",
     "DEFAULT_VIDEO_DISTANCE",
+    "default_workers",
     "SimilarMatch",
     "dhash_image",
     "hamming_distance",
@@ -66,6 +70,12 @@ DOCUMENT_EXTENSIONS = PLAIN_TEXT_EXTENSIONS | {".docx", ".pdf"}
 DEFAULT_IMAGE_DISTANCE = 6
 DEFAULT_TEXT_SIMILARITY = 0.9
 DEFAULT_VIDEO_DISTANCE = 10
+
+
+def default_workers() -> int:
+    """Default parallel workers: min(8, cpu_count or 4), at least 2."""
+    cpus = os.cpu_count() or 4
+    return max(2, min(8, cpus))
 
 # Video: 7 evenly spaced frames roughly spanning 10%-90% of the duration,
 # each reduced by ffmpeg to the same 9x8 grayscale grid used for dHash.
@@ -498,6 +508,8 @@ def run_similar_pass(
     inventory: Optional[Inventory] = None,
     progress: Optional[ProgressReporter] = None,
     quiet: bool = False,
+    workers: Optional[int] = None,
+    probe_cache: Optional[ProbeCache] = None,
 ) -> Tuple[List[Removal], Set[Path], List[SimilarMatch]]:
     """Find near-duplicate images and documents among the surviving files.
 
@@ -566,6 +578,13 @@ def run_similar_pass(
             pass
 
     # --- Images --------------------------------------------------------
+    if workers is None:
+        workers = default_workers()
+    elif workers < 1:
+        workers = 1
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=workers) if workers > 1 else None
+
+    # --- Images --------------------------------------------------------
     image_hash: Dict[Path, int] = {}
     image_pixels: Dict[Path, int] = {}
     if len(images) >= 2:
@@ -577,13 +596,46 @@ def run_similar_pass(
         if not have_pillow:
             _warn("image similarity skipped: Pillow not installed")
         else:
+            images_to_hash: List[Path] = []
             for fp in images:
-                result = dhash_image(fp)
-                if progress is not None:
-                    progress.maybe_status()
-                if result is None:
-                    continue
-                image_hash[fp], image_pixels[fp] = result
+                if probe_cache is not None:
+                    hit, res = probe_cache.get_image(
+                        fp, size_of.get(fp, 0), mtime_of.get(fp, 0.0)
+                    )
+                    if hit:
+                        if res is not None:
+                            image_hash[fp], image_pixels[fp] = res
+                        continue
+                images_to_hash.append(fp)
+
+            if images_to_hash:
+                if executor is not None:
+                    fut_map = {
+                        executor.submit(dhash_image, fp): fp
+                        for fp in images_to_hash
+                    }
+                    for fut in concurrent.futures.as_completed(fut_map):
+                        fp = fut_map[fut]
+                        res = fut.result()
+                        if res is not None:
+                            image_hash[fp], image_pixels[fp] = res
+                        if probe_cache is not None:
+                            probe_cache.set_image(
+                                fp, size_of.get(fp, 0), mtime_of.get(fp, 0.0), res
+                            )
+                        if progress is not None:
+                            progress.maybe_status()
+                else:
+                    for fp in images_to_hash:
+                        res = dhash_image(fp)
+                        if res is not None:
+                            image_hash[fp], image_pixels[fp] = res
+                        if probe_cache is not None:
+                            probe_cache.set_image(
+                                fp, size_of.get(fp, 0), mtime_of.get(fp, 0.0), res
+                            )
+                        if progress is not None:
+                            progress.maybe_status()
 
     hashed_images = [fp for fp in images if fp in image_hash]
     image_groups: List[List[Path]] = []
@@ -644,15 +696,48 @@ def run_similar_pass(
         paths = documents[suffix]
         if len(paths) < 2:
             continue
-        readable: List[Path] = []
+        docs_to_read: List[Path] = []
         for fp in paths:
-            shingles = document_shingles(fp, suffix)
-            if progress is not None:
-                progress.maybe_status()
-            if shingles is None:
-                continue
-            shingles_of[fp] = shingles
-            readable.append(fp)
+            if probe_cache is not None:
+                hit, res = probe_cache.get_document_shingles(
+                    fp, size_of.get(fp, 0), mtime_of.get(fp, 0.0)
+                )
+                if hit:
+                    if res is not None:
+                        shingles_of[fp] = res
+                    continue
+            docs_to_read.append(fp)
+
+        if docs_to_read:
+            if executor is not None:
+                fut_map = {
+                    executor.submit(document_shingles, fp, suffix): fp
+                    for fp in docs_to_read
+                }
+                for fut in concurrent.futures.as_completed(fut_map):
+                    fp = fut_map[fut]
+                    res = fut.result()
+                    if res is not None:
+                        shingles_of[fp] = res
+                    if probe_cache is not None:
+                        probe_cache.set_document_shingles(
+                            fp, size_of.get(fp, 0), mtime_of.get(fp, 0.0), res
+                        )
+                    if progress is not None:
+                        progress.maybe_status()
+            else:
+                for fp in docs_to_read:
+                    res = document_shingles(fp, suffix)
+                    if res is not None:
+                        shingles_of[fp] = res
+                    if probe_cache is not None:
+                        probe_cache.set_document_shingles(
+                            fp, size_of.get(fp, 0), mtime_of.get(fp, 0.0), res
+                        )
+                    if progress is not None:
+                        progress.maybe_status()
+
+        readable = [fp for fp in paths if fp in shingles_of]
         if len(readable) < 2:
             continue
 
@@ -709,12 +794,47 @@ def run_similar_pass(
             _warn("video similarity skipped: ffmpeg not found")
         else:
             probe: Dict[Path, Tuple[float, int, int]] = {}
+            videos_to_probe: List[Path] = []
             for fp in videos:
-                result = probe_video(fp)
-                if progress is not None:
-                    progress.maybe_status()
-                if result is not None:
-                    probe[fp] = result
+                if probe_cache is not None:
+                    hit, res = probe_cache.get_video_probe(
+                        fp, size_of.get(fp, 0), mtime_of.get(fp, 0.0)
+                    )
+                    if hit:
+                        if res is not None:
+                            probe[fp] = res
+                        continue
+                videos_to_probe.append(fp)
+
+            if videos_to_probe:
+                if executor is not None:
+                    fut_map = {
+                        executor.submit(probe_video, fp): fp
+                        for fp in videos_to_probe
+                    }
+                    for fut in concurrent.futures.as_completed(fut_map):
+                        fp = fut_map[fut]
+                        res = fut.result()
+                        if res is not None:
+                            probe[fp] = res
+                        if probe_cache is not None:
+                            probe_cache.set_video_probe(
+                                fp, size_of.get(fp, 0), mtime_of.get(fp, 0.0), res
+                            )
+                        if progress is not None:
+                            progress.maybe_status()
+                else:
+                    for fp in videos_to_probe:
+                        res = probe_video(fp)
+                        if res is not None:
+                            probe[fp] = res
+                        if probe_cache is not None:
+                            probe_cache.set_video_probe(
+                                fp, size_of.get(fp, 0), mtime_of.get(fp, 0.0), res
+                            )
+                        if progress is not None:
+                            progress.maybe_status()
+
             probed = [fp for fp in videos if fp in probe]
 
             duration_pairs: List[Tuple[Path, Path]] = []
@@ -728,13 +848,50 @@ def run_similar_pass(
             for a, b in duration_pairs:
                 needed.add(a)
                 needed.add(b)
+
+            needed_to_hash: List[Path] = []
             for fp in sorted(needed, key=lambda p: p.as_posix()):
-                hashes = video_frame_hashes(fp, probe[fp][0])
-                if progress is not None:
-                    progress.maybe_status()
-                if hashes is not None:
-                    video_hashes[fp] = hashes
-                    video_pixels[fp] = probe[fp][1] * probe[fp][2]
+                if probe_cache is not None:
+                    hit, cached_hashes = probe_cache.get_video_frames(
+                        fp, size_of.get(fp, 0), mtime_of.get(fp, 0.0)
+                    )
+                    if hit:
+                        if cached_hashes is not None:
+                            video_hashes[fp] = cached_hashes
+                            video_pixels[fp] = probe[fp][1] * probe[fp][2]
+                        continue
+                needed_to_hash.append(fp)
+
+            if needed_to_hash:
+                if executor is not None:
+                    fut_map = {
+                        executor.submit(video_frame_hashes, fp, probe[fp][0]): fp
+                        for fp in needed_to_hash
+                    }
+                    for fut in concurrent.futures.as_completed(fut_map):
+                        fp = fut_map[fut]
+                        hashes = fut.result()
+                        if hashes is not None:
+                            video_hashes[fp] = hashes
+                            video_pixels[fp] = probe[fp][1] * probe[fp][2]
+                        if probe_cache is not None:
+                            probe_cache.set_video_frames(
+                                fp, size_of.get(fp, 0), mtime_of.get(fp, 0.0), hashes
+                            )
+                        if progress is not None:
+                            progress.maybe_status()
+                else:
+                    for fp in needed_to_hash:
+                        hashes = video_frame_hashes(fp, probe[fp][0])
+                        if hashes is not None:
+                            video_hashes[fp] = hashes
+                            video_pixels[fp] = probe[fp][1] * probe[fp][2]
+                        if probe_cache is not None:
+                            probe_cache.set_video_frames(
+                                fp, size_of.get(fp, 0), mtime_of.get(fp, 0.0), hashes
+                            )
+                        if progress is not None:
+                            progress.maybe_status()
 
             index_of = {fp: i for i, fp in enumerate(probed)}
             uf = UnionFind(len(probed))
@@ -800,6 +957,9 @@ def run_similar_pass(
                 trash_manager.remove_file(fp)
             except OSError:
                 pass
+
+    if executor is not None:
+        executor.shutdown(wait=True)
 
     if progress is not None:
         progress.end_pass("similar")

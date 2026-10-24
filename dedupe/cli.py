@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 from typing import List
 
-from dedupe.core import Removal, TrashManager
+from dedupe.core import HashCache, ProgressReporter, Removal, TrashManager, build_inventory
 from dedupe.exact import run_exact_pass
 from dedupe.folder import run_folder_pass
 from dedupe.fuzzy import run_fuzzy_pass
@@ -49,6 +49,11 @@ def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
         default=10,
         help="Minimum common substring length in normalized stems for fuzzy matching (default: 10; 0 disables)",
     )
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Suppress progress output on stderr",
+    )
     return parser.parse_args(argv)
 
 
@@ -59,7 +64,11 @@ def run_dedupe(
     no_fuzzy: bool = False,
     threshold: float = 0.9,
     min_match: int = 10,
+    quiet: bool = False,
 ) -> int:
+    progress = ProgressReporter(quiet=quiet)
+    progress.start(target_path)
+
     root = Path(target_path).resolve()
     if not root.exists():
         sys.stderr.write(f"Error: path '{target_path}' does not exist\n")
@@ -71,27 +80,40 @@ def run_dedupe(
     trash_manager = TrashManager(root=root, dry_run=dry_run, permanent=permanent)
     all_removals: List[Removal] = []
 
+    # Single walk: build the inventory once for all passes.
+    inventory = build_inventory(root, progress=progress)
+    hash_cache = HashCache(inventory=inventory, progress=progress)
+
     # Pass 1: Duplicate folders
+    progress.set_pass("folder")
     folder_removals, removed_folders = run_folder_pass(
         root=root,
         trash_manager=trash_manager,
         dry_run=dry_run,
         permanent=permanent,
+        inventory=inventory,
+        hash_cache=hash_cache,
+        progress=progress,
     )
     all_removals.extend(folder_removals)
 
     # Pass 2: Exact duplicate files across the whole tree
+    progress.set_pass("exact")
     exact_removals, removed_files = run_exact_pass(
         root=root,
         trash_manager=trash_manager,
         removed_folders=removed_folders,
         dry_run=dry_run,
         permanent=permanent,
+        inventory=inventory,
+        hash_cache=hash_cache,
+        progress=progress,
     )
     all_removals.extend(exact_removals)
 
     # Pass 3: Fuzzy-name duplicates in same folder with same extension
     if not no_fuzzy:
+        progress.set_pass("fuzzy")
         fuzzy_removals, _ = run_fuzzy_pass(
             root=root,
             trash_manager=trash_manager,
@@ -101,6 +123,8 @@ def run_dedupe(
             min_match=min_match,
             dry_run=dry_run,
             permanent=permanent,
+            inventory=inventory,
+            progress=progress,
         )
         all_removals.extend(fuzzy_removals)
 
@@ -131,6 +155,7 @@ def run_dedupe(
         f"{total_bytes} bytes freed"
     )
 
+    progress.done()
     return 0
 
 
@@ -143,4 +168,5 @@ def main(argv: List[str] | None = None) -> int:
         no_fuzzy=args.no_fuzzy,
         threshold=args.threshold,
         min_match=args.min_match,
+        quiet=args.quiet,
     )

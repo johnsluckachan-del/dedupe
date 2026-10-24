@@ -40,7 +40,7 @@ python -m dedupe PATH [options]
 ## CLI Options
 
 ```text
-usage: dedupe [-h] [--dry-run] [--permanent] [--no-fuzzy]
+usage: dedupe [-h] [--dry-run] [--permanent] [--no-fuzzy] [--quiet]
               [--threshold THRESHOLD] [--min-match MIN_MATCH]
               path
 
@@ -57,9 +57,16 @@ options:
   --min-match MIN_MATCH
                         Minimum common substring length in normalized stems
                         for fuzzy matching (default: 10; 0 disables)
+  --quiet               Suppress progress output on stderr
 ```
 
 ---
+
+## Progress Output
+
+Progress is printed to stderr (stdout keeps only the removal lines and summary). The first line is `Scanning <path> ...`, printed and flushed immediately. While walking and hashing, a status line is printed at most every 2 seconds showing files found, bytes, the current pass, and files hashed; on an interactive terminal it may overwrite itself. The last stderr line starts with `Done` and shows the elapsed time. Use `--quiet` to suppress all progress output on stderr (errors are still printed to stderr).
+
+The tree is walked once and files are hashed lazily through a shared cache: each file is hashed at most once per run, and a file whose size is unique among non-empty files is never hashed. Note that the first run on a big network share still reads every file that has a same-size twin.
 
 ## Order of Passes
 
@@ -71,8 +78,8 @@ options:
 
 2. **Pass 2 - Exact Duplicate Files**:
    - Compares surviving regular files across the entire tree.
-   - Files are grouped by size, then hashed in chunks using SHA-256. Zero-byte files are skipped.
-   - Keeper selection: shallowest directory depth, then shortest file name, then oldest modification time (`mtime`), then alphabetical order.
+   - Files are grouped by size; only files sharing a first block are then hashed in chunks using SHA-256 (through the shared cache). Zero-byte files are skipped.
+   - Keeper selection: shortest file name, then alphabetical file name, then oldest modification time (`mtime`), then shallowest directory depth, then alphabetical path.
 
 3. **Pass 3 - Fuzzy-Name Duplicate Files**:
    - Skipped if `--no-fuzzy` is specified. Zero-byte files are skipped.

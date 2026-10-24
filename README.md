@@ -1,11 +1,11 @@
 # dedupe
 
-A command-line tool to scan a folder recursively and safely remove duplicate folders, exact duplicate files, fuzzy-name duplicate files, torrent video duplicates, and near-duplicate images and documents. Built with the Python 3.12 standard library; only the near-duplicate image/PDF readers are optional third-party extras, and everything runs on this PC with no network use.
+A command-line tool to scan a folder recursively and safely remove duplicate folders, exact duplicate files, fuzzy-name duplicate files, torrent video duplicates, and near-duplicate images, documents and videos. Built with the Python 3.12 standard library; the near-duplicate image/PDF readers are optional third-party extras and video content similarity needs a local ffmpeg/ffprobe, and everything runs on this PC with no network use.
 
 ## Key Features
 
 - **Duplicate Folders**: Identifies non-empty folders whose entire recursive structure and SHA-256 file contents match. Only top-most matching folders are removed whole.
-- **Exact Duplicate Files**: Scans the whole tree for identical files by size and chunked SHA-256 hashes (skipping zero-byte files).
+- **Exact Duplicate Files**: Scans the whole tree for identical files by size and chunked SHA-256 hashes (skipping zero-byte files). Same-size files of 8 MiB or more first get a cheap blake2b fingerprint (first, middle and last 1 MiB); only files whose fingerprint matches get the full SHA-256, so a multi-GB video that turns out to differ is never read in full.
 - **Fuzzy-Name Duplicate Files**: Identifies copy-named variants (e.g. `report (1).docx`, `Copy of budget.xlsx`, `file - Copy.docx`) and files sharing $N+$ common characters within the same folder and same extension using stem normalization, `difflib.SequenceMatcher` ratio, and longest common contiguous substring matching (`--min-match`).
 - **Numbered Sequence Protection**: Excludes files that differ only in numbers/digits (e.g. `IMG_0001.jpg` vs `IMG_0002.jpg`, `chapter-1.md` vs `chapter-2.md`).
 - **Safety First**:
@@ -44,6 +44,7 @@ usage: dedupe [-h] [--dry-run] [--permanent] [--no-fuzzy] [--quiet]
               [--threshold THRESHOLD] [--min-match MIN_MATCH]
               [--no-similar] [--review] [--delete-similar]
               [--image-distance N] [--text-similarity R]
+              [--video-distance N]
               path
 
 positional arguments:
@@ -69,6 +70,8 @@ options:
                         (default: 6)
   --text-similarity R   Min shingle Jaccard for similar documents
                         (default: 0.9)
+  --video-distance N    Max per-frame dHash Hamming distance for similar
+                        videos (default: 10)
   --quiet               Suppress progress output on stderr
 ```
 
@@ -126,11 +129,11 @@ Examples of what never matches:
 
 Samples and leftovers: a video with the token `sample` (or inside a `Sample` folder) that is under 1/10 of the size of a non-sample video in the same torrent folder (or its parent) is removed with reason `sample`. After a video is removed, if its torrent folder (its parent, not the scan root) holds only junk (`.nfo .txt .jpg .jpeg .png .srt .sub .idx .ass .url .sfv .md5 .exe .lnk` files, sample videos, empty folders, or a `Subs`/`Sample` subfolder), the whole folder is removed with reason `torrent-leftover`. A folder holding any other file (for example a document or another non-sample video) is kept. `video-name` and `sample` removals count as duplicates found; `torrent-leftover` folders do not.
 
-## Near-Duplicate Images and Documents (similar pass)
+## Near-Duplicate Images, Documents and Videos (similar pass)
 
-Pass 4 runs after the video-names pass, on the files that survived passes 1-3, and finds the near-duplicates that byte-for-byte matching misses: a photo saved again at a smaller size or a lower JPEG quality, a document edited after a copy was filed elsewhere. It runs **entirely on this PC**: no cloud service, no API key, and no network use of any kind. It never prompts and never reads stdin.
+Pass 4 runs after the video-names pass, on the files that survived passes 1-3, and finds the near-duplicates that byte-for-byte matching misses: a photo saved again at a smaller size or a lower JPEG quality, a document edited after a copy was filed elsewhere, a film re-encoded smaller and renamed to something the video-names pass cannot recognise (`VID-001.mkv`). It runs **entirely on this PC**: no cloud service, no API key, and no network use of any kind (ffmpeg and ffprobe are local programs). It never prompts and never reads stdin.
 
-Near-duplicates are **removed by default**, exactly like any other duplicate: trash by default, `--permanent` and `--dry-run` respected, with reason `similar-image` or `similar-document`. They count in `duplicates found`. `--delete-similar` asks for that default explicitly and changes nothing.
+Near-duplicates are **removed by default**, exactly like any other duplicate: trash by default, `--permanent` and `--dry-run` respected, with reason `similar-image`, `similar-document` or `similar-video`. They count in `duplicates found`. `--delete-similar` asks for that default explicitly and changes nothing.
 
 - **Images** (`.jpg .jpeg .png .bmp .gif .webp .tif .tiff`, any case): a 64-bit perceptual difference hash (dHash — grayscale, resized to 9x8, each pixel compared with its right neighbour) via Pillow. Two images are near-duplicates when the Hamming distance between their hashes is at most `--image-distance` (default `6`), compared across the whole tree. Candidates come from splitting each hash into 8 bands of 8 bits and only comparing images that share a whole band, so nothing is compared with everything (any pair within distance 7 must share a band). Keeper: most pixels, then biggest file, then the pass-2 keeper rule.
 - **Documents** (`.txt .md .csv .docx .pdf`): text is extracted locally (`.docx` from `word/document.xml` with `zipfile` + `xml.etree`; `.pdf` with `pypdf` when it is installed), lowercased, whitespace-collapsed and split into words, reading at most the first 2 MB of text. Similarity is the Jaccard overlap of 5-word shingles, and documents are near-duplicates at `--text-similarity` or above (default `0.9`). Candidates come from MinHash + LSH banding and are confirmed with the real Jaccard. Only documents with the **same extension** are compared — `plan.txt` and `plan.docx` are an intentional export, never a duplicate. Documents under 50 words are skipped. Keeper: newest modification time, then biggest file.

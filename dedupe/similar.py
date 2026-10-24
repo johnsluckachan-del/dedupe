@@ -1,9 +1,10 @@
-"""Pass 4: near-duplicate images and documents (the "similar" pass).
+"""Pass 4: near-duplicate images, documents and videos (the "similar" pass).
 
 Everything here runs on this machine only: a perceptual difference hash
-(dHash) for images through Pillow, and shingled MinHash/LSH over extracted
-text for documents. No network calls, no services, no API keys -- the pass
-only ever opens local files.
+(dHash) for images through Pillow, shingled MinHash/LSH over extracted
+text for documents, and local ffmpeg/ffprobe frame grabs hashed the same
+way (dHash) for videos. No network calls, no services, no API keys -- the
+pass only ever opens local files and spawns ffmpeg/ffprobe.
 
 Near-duplicates are removed like any other duplicate by default; the caller
 can ask for a listing instead (``review=True``), in which case nothing from
@@ -14,6 +15,9 @@ from __future__ import annotations
 
 import hashlib
 import importlib
+import json
+import shutil
+import subprocess
 import sys
 import xml.etree.ElementTree as ET
 import zipfile
@@ -29,6 +33,7 @@ from dedupe.core import (
     build_inventory,
 )
 from dedupe.fuzzy import UnionFind
+from dedupe.video import VIDEO_EXTENSIONS
 
 __all__ = [
     "IMAGE_EXTENSIONS",
@@ -36,6 +41,7 @@ __all__ = [
     "PLAIN_TEXT_EXTENSIONS",
     "DEFAULT_IMAGE_DISTANCE",
     "DEFAULT_TEXT_SIMILARITY",
+    "DEFAULT_VIDEO_DISTANCE",
     "SimilarMatch",
     "dhash_image",
     "hamming_distance",
@@ -44,6 +50,10 @@ __all__ = [
     "document_shingles",
     "shingle_set",
     "jaccard",
+    "ffprobe_command",
+    "probe_video",
+    "video_frame_hashes",
+    "frames_matching",
     "run_similar_pass",
 ]
 
@@ -55,6 +65,13 @@ DOCUMENT_EXTENSIONS = PLAIN_TEXT_EXTENSIONS | {".docx", ".pdf"}
 
 DEFAULT_IMAGE_DISTANCE = 6
 DEFAULT_TEXT_SIMILARITY = 0.9
+DEFAULT_VIDEO_DISTANCE = 10
+
+# Video: 7 evenly spaced frames roughly spanning 10%-90% of the duration,
+# each reduced by ffmpeg to the same 9x8 grayscale grid used for dHash.
+VIDEO_FRAME_COUNT = 7
+VIDEO_FRAME_MATCH_NEEDED = 5
+_FFMPEG_TIMEOUT = 60
 
 # dHash: 9x8 grayscale, each pixel compared with its right neighbour.
 DHASH_WIDTH = 9
@@ -91,8 +108,8 @@ class SimilarMatch:
 
     removed_path: Path
     kept_path: Path
-    kind: str  # "image" or "document"
-    score_text: str  # "distance 3", "similarity 0.95"
+    kind: str  # "image", "document" or "video"
+    score_text: str  # "distance 3", "similarity 0.95", "frames 7/7"
 
 
 # --------------------------------------------------------------------------
@@ -107,6 +124,18 @@ def _resampling_filter():
     if resampling is not None:
         return resampling.LANCZOS
     return Image.LANCZOS
+
+
+def _dhash_from_gray(data: Sequence[int]) -> Optional[int]:
+    """64-bit dHash of a 9x8 grayscale grid, or None when the grid is short."""
+    if len(data) < DHASH_WIDTH * DHASH_HEIGHT:
+        return None
+    bits = 0
+    for y in range(DHASH_HEIGHT):
+        row = y * DHASH_WIDTH
+        for x in range(DHASH_WIDTH - 1):
+            bits = (bits << 1) | (1 if data[row + x] < data[row + x + 1] else 0)
+    return bits
 
 
 def dhash_image(path: Path) -> Optional[Tuple[int, int]]:
@@ -126,13 +155,9 @@ def dhash_image(path: Path) -> Optional[Tuple[int, int]]:
             data = list(small.getdata())
     except Exception:
         return None
-    if len(data) < DHASH_WIDTH * DHASH_HEIGHT:
+    bits = _dhash_from_gray(data)
+    if bits is None:
         return None
-    bits = 0
-    for y in range(DHASH_HEIGHT):
-        row = y * DHASH_WIDTH
-        for x in range(DHASH_WIDTH - 1):
-            bits = (bits << 1) | (1 if data[row + x] < data[row + x + 1] else 0)
     return bits, pixels
 
 
@@ -148,6 +173,133 @@ def band_keys(value: int) -> List[Tuple[int, int]]:
         (band, (value >> (band * HASH_BAND_BITS)) & mask)
         for band in range(HASH_BANDS)
     ]
+
+
+# --------------------------------------------------------------------------
+# Videos
+# --------------------------------------------------------------------------
+
+
+def _have_ffmpeg_tools() -> bool:
+    return shutil.which("ffmpeg") is not None and shutil.which("ffprobe") is not None
+
+
+def ffprobe_command(path: Path) -> List[str]:
+    """The ffprobe argv used to read one video's duration and frame size.
+
+    No ``-nostdin`` here: that option belongs to ffmpeg only, and ffprobe
+    rejects unknown options outright (exit 1, nothing on stdout), which would
+    make every video unprobeable. ``stdin=subprocess.DEVNULL`` on the call
+    gives the same guarantee of never touching the terminal.
+    """
+    return [
+        "ffprobe", "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=width,height,duration:format=duration",
+        "-of", "json", str(path),
+    ]
+
+
+def _positive_float(value) -> Optional[float]:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
+
+
+def probe_video(path: Path) -> Optional[Tuple[float, int, int]]:
+    """Return ``(duration seconds, width, height)`` via ffprobe, or None.
+
+    None means "skip this file silently": ffprobe missing, a corrupt or
+    non-video file, or a stream with no usable duration or frame size.
+    """
+    try:
+        proc = subprocess.run(
+            ffprobe_command(path),
+            capture_output=True, timeout=_FFMPEG_TIMEOUT, stdin=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    try:
+        data = json.loads(proc.stdout)
+        streams = data.get("streams") or []
+        if not streams:
+            return None
+        stream = streams[0]
+        width = int(stream["width"])
+        height = int(stream["height"])
+    except Exception:
+        return None
+    # Container duration first; some containers (Matroska is the common one)
+    # only carry it on the stream, so fall back to that before giving up.
+    duration = _positive_float((data.get("format") or {}).get("duration"))
+    if duration is None:
+        duration = _positive_float(stream.get("duration"))
+    if duration is None or width <= 0 or height <= 0:
+        return None
+    return duration, width, height
+
+
+def _frame_fractions(count: int = VIDEO_FRAME_COUNT) -> List[float]:
+    if count <= 1:
+        return [0.5]
+    return [0.1 + i * (0.8 / (count - 1)) for i in range(count)]
+
+
+def _grab_frame_hash(path: Path, t: float) -> Optional[int]:
+    try:
+        proc = subprocess.run(
+            [
+                "ffmpeg", "-nostdin", "-ss", f"{t:.3f}", "-i", str(path),
+                "-frames:v", "1", "-vf", f"scale={DHASH_WIDTH}:{DHASH_HEIGHT},format=gray",
+                # -an/-sn: nothing but the picture may reach the raw pipe.
+                "-an", "-sn", "-f", "rawvideo", "-",
+            ],
+            capture_output=True, timeout=_FFMPEG_TIMEOUT, stdin=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    # scale=9:8,format=gray over rawvideo is exactly 72 packed bytes.
+    return _dhash_from_gray(proc.stdout)
+
+
+def video_frame_hashes(path: Path, duration: float) -> Optional[List[Optional[int]]]:
+    """dHash per evenly spaced frame (None for a frame that would not decode).
+
+    A single unreadable frame only costs that frame: it can never count as a
+    match, so a video that still yields ``VIDEO_FRAME_MATCH_NEEDED`` frames can
+    be judged. Fewer than that means the file is not judgeable at all
+    (unreadable/corrupt/truncated) and the whole video is skipped silently,
+    signalled by None.
+    """
+    hashes: List[Optional[int]] = []
+    for frac in _frame_fractions():
+        t = max(0.0, min(duration - 0.01, duration * frac))
+        hashes.append(_grab_frame_hash(path, t))
+    if sum(1 for h in hashes if h is not None) < VIDEO_FRAME_MATCH_NEEDED:
+        return None
+    return hashes
+
+
+def frames_matching(
+    a: Sequence[Optional[int]], b: Sequence[Optional[int]], distance: int
+) -> int:
+    """How many frame pairs are within ``distance`` bits of each other."""
+    return sum(
+        1
+        for ha, hb in zip(a, b)
+        if ha is not None and hb is not None and hamming_distance(ha, hb) <= distance
+    )
+
+
+def _duration_close(a: float, b: float) -> bool:
+    tol = max(2.0, 0.02 * max(a, b))
+    return abs(a - b) <= tol
 
 
 # --------------------------------------------------------------------------
@@ -341,6 +493,7 @@ def run_similar_pass(
     review: bool = False,
     image_distance: int = DEFAULT_IMAGE_DISTANCE,
     text_similarity: float = DEFAULT_TEXT_SIMILARITY,
+    video_distance: int = DEFAULT_VIDEO_DISTANCE,
     *,
     inventory: Optional[Inventory] = None,
     progress: Optional[ProgressReporter] = None,
@@ -366,6 +519,7 @@ def run_similar_pass(
     mtime_of: Dict[Path, float] = {}
     images: List[Path] = []
     documents: Dict[str, List[Path]] = {}
+    videos: List[Path] = []
     for info in inventory.files:
         fp = info.path
         size_of[fp] = info.size
@@ -379,7 +533,10 @@ def run_similar_pass(
             images.append(fp)
         elif suffix in DOCUMENT_EXTENSIONS:
             documents.setdefault(suffix, []).append(fp)
+        elif suffix in VIDEO_EXTENSIONS:
+            videos.append(fp)
     images.sort(key=lambda p: p.as_posix())
+    videos.sort(key=lambda p: p.as_posix())
     for paths in documents.values():
         paths.sort(key=lambda p: p.as_posix())
 
@@ -539,6 +696,81 @@ def run_similar_pass(
                     kept_path=keeper,
                     kind="document",
                     score_text=f"similarity {score:.2f}",
+                )
+            )
+
+    # --- Videos ----------------------------------------------------------
+    video_hashes: Dict[Path, List[Optional[int]]] = {}
+    video_pixels: Dict[Path, int] = {}
+    video_groups: List[List[Path]] = []
+    match_count: Dict[Tuple[Path, Path], int] = {}
+    if len(videos) >= 2:
+        if not _have_ffmpeg_tools():
+            _warn("video similarity skipped: ffmpeg not found")
+        else:
+            probe: Dict[Path, Tuple[float, int, int]] = {}
+            for fp in videos:
+                result = probe_video(fp)
+                if progress is not None:
+                    progress.maybe_status()
+                if result is not None:
+                    probe[fp] = result
+            probed = [fp for fp in videos if fp in probe]
+
+            duration_pairs: List[Tuple[Path, Path]] = []
+            for i in range(len(probed)):
+                for j in range(i + 1, len(probed)):
+                    a, b = probed[i], probed[j]
+                    if _duration_close(probe[a][0], probe[b][0]):
+                        duration_pairs.append((a, b))
+
+            needed: Set[Path] = set()
+            for a, b in duration_pairs:
+                needed.add(a)
+                needed.add(b)
+            for fp in sorted(needed, key=lambda p: p.as_posix()):
+                hashes = video_frame_hashes(fp, probe[fp][0])
+                if progress is not None:
+                    progress.maybe_status()
+                if hashes is not None:
+                    video_hashes[fp] = hashes
+                    video_pixels[fp] = probe[fp][1] * probe[fp][2]
+
+            index_of = {fp: i for i, fp in enumerate(probed)}
+            uf = UnionFind(len(probed))
+            for a, b in duration_pairs:
+                if a not in video_hashes or b not in video_hashes:
+                    continue
+                n = frames_matching(video_hashes[a], video_hashes[b], video_distance)
+                if n >= VIDEO_FRAME_MATCH_NEEDED:
+                    match_count[(a, b)] = n
+                    uf.union(index_of[a], index_of[b])
+            video_groups = _groups_from(uf, probed)
+            video_groups = [[p for p in g if p in video_hashes] for g in video_groups]
+            video_groups = [g for g in video_groups if len(g) >= 2]
+
+    def _video_keeper_key(p: Path):
+        return (-video_pixels.get(p, 0), -size_of.get(p, 0), _depth(p), _rel_posix(p))
+
+    video_groups.sort(key=lambda g: min(_video_keeper_key(p) for p in g))
+    for group in video_groups:
+        keeper = min(group, key=_video_keeper_key)
+        for fp in group:
+            if fp == keeper:
+                continue
+            n = match_count.get((fp, keeper))
+            if n is None:
+                n = match_count.get((keeper, fp))
+            if n is None:
+                n = frames_matching(
+                    video_hashes[fp], video_hashes[keeper], video_distance
+                )
+            matches.append(
+                SimilarMatch(
+                    removed_path=fp,
+                    kept_path=keeper,
+                    kind="video",
+                    score_text=f"frames {n}/{VIDEO_FRAME_COUNT}",
                 )
             )
 

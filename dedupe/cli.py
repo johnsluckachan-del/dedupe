@@ -5,17 +5,19 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 from dedupe.core import HashCache, HeartbeatMonitor, ProgressReporter, Removal, TrashManager, build_inventory
 from dedupe.exact import run_exact_pass
 from dedupe.folder import run_folder_pass
 from dedupe.fuzzy import run_fuzzy_pass
+from dedupe.cache import ProbeCache, default_cache_dir
 from dedupe.similar import (
     DEFAULT_IMAGE_DISTANCE,
     DEFAULT_TEXT_SIMILARITY,
     DEFAULT_VIDEO_DISTANCE,
     SimilarMatch,
+    default_workers,
     run_similar_pass,
 )
 from dedupe.video import run_video_pass
@@ -91,6 +93,23 @@ def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
         help=f"Max per-frame dHash Hamming distance for similar videos (default: {DEFAULT_VIDEO_DISTANCE})",
     )
     parser.add_argument(
+        "--workers",
+        type=int,
+        default=default_workers(),
+        help=f"Number of parallel workers for probing (default: {default_workers()})",
+    )
+    parser.add_argument(
+        "--cache-dir",
+        type=Path,
+        default=None,
+        help="Custom probe cache directory (default: %LOCALAPPDATA%\\dedupe\\cache or ~/.cache/dedupe)",
+    )
+    parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="Disable reading and writing the probe cache",
+    )
+    parser.add_argument(
         "--quiet",
         action="store_true",
         help="Suppress progress output on stderr",
@@ -111,7 +130,22 @@ def run_dedupe(
     image_distance: int = DEFAULT_IMAGE_DISTANCE,
     text_similarity: float = DEFAULT_TEXT_SIMILARITY,
     video_distance: int = DEFAULT_VIDEO_DISTANCE,
+    workers: Optional[int] = None,
+    cache_dir: Optional[Path | str] = None,
+    no_cache: bool = False,
 ) -> int:
+    if workers is None:
+        workers = default_workers()
+    elif workers < 1:
+        workers = 1
+
+    if cache_dir is None:
+        cache_dir = default_cache_dir()
+    else:
+        cache_dir = Path(cache_dir)
+
+    probe_cache = ProbeCache(cache_dir=cache_dir, no_cache=no_cache)
+
     progress = ProgressReporter(quiet=quiet)
     progress.start(target_path)
 
@@ -209,11 +243,14 @@ def run_dedupe(
                 inventory=inventory,
                 progress=progress,
                 quiet=quiet,
+                workers=workers,
+                probe_cache=probe_cache,
             )
             heartbeat.end()
             all_removals.extend(similar_removals)
     finally:
         heartbeat.stop()
+        probe_cache.save()
 
     def rel(path: Path) -> Path:
         try:
@@ -283,4 +320,7 @@ def main(argv: List[str] | None = None) -> int:
         image_distance=args.image_distance,
         text_similarity=args.text_similarity,
         video_distance=args.video_distance,
+        workers=args.workers,
+        cache_dir=args.cache_dir,
+        no_cache=args.no_cache,
     )

@@ -117,15 +117,18 @@ class ProgressReporter:
         except Exception:
             return False
 
+    def _write_unlocked(self, text: str) -> None:
+        try:
+            self.stream.write(text)
+            self.stream.flush()
+        except Exception:
+            pass
+
     def _write(self, text: str) -> None:
         # Heartbeat lines come from a background thread while the main
         # thread may be writing status/done lines; keep each line whole.
         with self._write_lock:
-            try:
-                self.stream.write(text)
-                self.stream.flush()
-            except Exception:
-                pass
+            self._write_unlocked(text)
 
     def start(self, path) -> None:
         self.start_time = time.monotonic()
@@ -141,25 +144,30 @@ class ProgressReporter:
         )
 
     def set_pass(self, name: str) -> None:
-        self.current_pass = name
+        with self._write_lock:
+            self.current_pass = name
         self.maybe_status()
 
     def end_pass(self, name: str | None = None) -> None:
-        if name is not None:
-            self.current_pass = name
+        with self._write_lock:
+            if name is not None:
+                self.current_pass = name
         self.maybe_status(force=True)
 
     def note_file(self, size: int = 0) -> None:
-        self.files_found += 1
-        self.total_bytes += size
+        with self._write_lock:
+            self.files_found += 1
+            self.total_bytes += size
         self.maybe_status()
 
     def note_hash(self) -> None:
-        self.files_hashed += 1
+        with self._write_lock:
+            self.files_hashed += 1
         self.maybe_status()
 
     def note_duplicate(self, count: int = 1) -> None:
-        self.duplicates_found += count
+        with self._write_lock:
+            self.duplicates_found += count
         self.maybe_status()
 
     def add_duplicates(self, count: int = 1) -> None:
@@ -167,28 +175,31 @@ class ProgressReporter:
 
     def note_similar(self, count: int = 1) -> None:
         """Near-duplicates found by the similar pass, removed or only listed."""
-        self.similar_found += count
+        with self._write_lock:
+            self.similar_found += count
         self.maybe_status()
 
     def maybe_status(self, force: bool = False) -> None:
         if self.quiet:
             return
-        now = time.monotonic()
-        if not force and (now - self._last_status) < self.interval:
-            return
-        self._last_status = now
-        self._write(self._format_status() + "\n")
+        with self._write_lock:
+            now = time.monotonic()
+            if not force and (now - self._last_status) < self.interval:
+                return
+            self._last_status = now
+            self._write_unlocked(self._format_status() + "\n")
 
     def done(self) -> None:
         if self.quiet:
             return
         elapsed = time.monotonic() - self.start_time
         self._overwrote = False
-        self._write(
-            f"Done in {elapsed:.2f}s: {self.files_found:,} files scanned, "
-            f"{self.duplicates_found:,} duplicates found, "
-            f"{self.similar_found:,} similar found\n"
-        )
+        with self._write_lock:
+            self._write_unlocked(
+                f"Done in {elapsed:.2f}s: {self.files_found:,} files scanned, "
+                f"{self.duplicates_found:,} duplicates found, "
+                f"{self.similar_found:,} similar found\n"
+            )
 
     def heartbeat(self, label: str, elapsed: float) -> None:
         """A '(still ...)' line printed by HeartbeatMonitor's background thread."""

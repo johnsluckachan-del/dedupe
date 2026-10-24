@@ -45,6 +45,8 @@ __all__ = [
     "DEFAULT_IMAGE_DISTANCE",
     "DEFAULT_TEXT_SIMILARITY",
     "DEFAULT_VIDEO_DISTANCE",
+    "FLAT_THRESHOLD",
+    "is_thumbnail_flat",
     "default_workers",
     "SimilarMatch",
     "dhash_image",
@@ -70,6 +72,14 @@ DOCUMENT_EXTENSIONS = PLAIN_TEXT_EXTENSIONS | {".docx", ".pdf"}
 DEFAULT_IMAGE_DISTANCE = 6
 DEFAULT_TEXT_SIMILARITY = 0.9
 DEFAULT_VIDEO_DISTANCE = 10
+FLAT_THRESHOLD = 8
+
+
+def is_thumbnail_flat(data: Sequence[int], threshold: int = FLAT_THRESHOLD) -> bool:
+    """Return True if 9x8 grayscale thumbnail has max - min <= threshold."""
+    if not data:
+        return False
+    return (max(data) - min(data)) <= threshold
 
 
 def default_workers() -> int:
@@ -164,6 +174,10 @@ def dhash_image(path: Path) -> Optional[Tuple[int, int]]:
             )
             data = list(small.getdata())
     except Exception:
+        return None
+    if len(data) < DHASH_WIDTH * DHASH_HEIGHT:
+        return None
+    if is_thumbnail_flat(data):
         return None
     bits = _dhash_from_gray(data)
     if bits is None:
@@ -275,7 +289,12 @@ def _grab_frame_hash(path: Path, t: float) -> Optional[int]:
     if proc.returncode != 0:
         return None
     # scale=9:8,format=gray over rawvideo is exactly 72 packed bytes.
-    return _dhash_from_gray(proc.stdout)
+    if len(proc.stdout) < DHASH_WIDTH * DHASH_HEIGHT:
+        return None
+    grid = proc.stdout[:DHASH_WIDTH * DHASH_HEIGHT]
+    if is_thumbnail_flat(grid):
+        return None
+    return _dhash_from_gray(grid)
 
 
 def video_frame_hashes(path: Path, duration: float) -> Optional[List[Optional[int]]]:
@@ -632,7 +651,7 @@ def run_similar_pass(
                             image_hash[fp], image_pixels[fp] = res
                         if probe_cache is not None:
                             probe_cache.set_image(
-                                fp, size_of.get(fp, 0), mtime_of.get(fp, 0.0), res
+                                fp, size_of.get(fp, 0), mtime_of.get(fp, 0.0), res, is_flat=(res is None)
                             )
                         if progress is not None:
                             progress.note_similar_done("images")
@@ -643,7 +662,7 @@ def run_similar_pass(
                             image_hash[fp], image_pixels[fp] = res
                         if probe_cache is not None:
                             probe_cache.set_image(
-                                fp, size_of.get(fp, 0), mtime_of.get(fp, 0.0), res
+                                fp, size_of.get(fp, 0), mtime_of.get(fp, 0.0), res, is_flat=(res is None)
                             )
                         if progress is not None:
                             progress.note_similar_done("images")
@@ -902,7 +921,7 @@ def run_similar_pass(
                             video_pixels[fp] = probe[fp][1] * probe[fp][2]
                         if probe_cache is not None:
                             probe_cache.set_video_frames(
-                                fp, size_of.get(fp, 0), mtime_of.get(fp, 0.0), hashes
+                                fp, size_of.get(fp, 0), mtime_of.get(fp, 0.0), hashes, is_flat=(hashes is None)
                             )
                         if progress is not None:
                             progress.maybe_status()
@@ -914,7 +933,7 @@ def run_similar_pass(
                             video_pixels[fp] = probe[fp][1] * probe[fp][2]
                         if probe_cache is not None:
                             probe_cache.set_video_frames(
-                                fp, size_of.get(fp, 0), mtime_of.get(fp, 0.0), hashes
+                                fp, size_of.get(fp, 0), mtime_of.get(fp, 0.0), hashes, is_flat=(hashes is None)
                             )
                         if progress is not None:
                             progress.maybe_status()

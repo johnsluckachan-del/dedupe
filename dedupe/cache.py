@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Dict, FrozenSet, List, Optional, Tuple
 
 MAX_CACHE_ENTRIES = 200_000
+CACHE_VERSION = 2
 
 
 def default_cache_dir() -> Path:
@@ -58,20 +59,20 @@ class ProbeCache:
         try:
             with open(self.cache_file, "r", encoding="utf-8") as f:
                 raw = json.load(f)
-            if isinstance(raw, dict):
+            if isinstance(raw, dict) and raw.get("_version") == CACHE_VERSION:
                 self._data = raw
             else:
-                self._data = {}
+                self._data = {"_version": CACHE_VERSION}
         except Exception:
             # A missing, unreadable or corrupt cache is ignored and rebuilt;
             # never crash and never print a traceback.
-            self._data = {}
+            self._data = {"_version": CACHE_VERSION}
 
     def _get_entry(self, path: Path, size: int, mtime: float) -> Optional[dict]:
         key = str(Path(path).resolve())
         with self._lock:
             entry = self._data.get(key)
-            if entry is None:
+            if entry is None or not isinstance(entry, dict):
                 return None
             if entry.get("size") != size:
                 return None
@@ -85,6 +86,7 @@ class ProbeCache:
         entry = self._data.get(key)
         if (
             entry is None
+            or not isinstance(entry, dict)
             or entry.get("size") != size
             or entry.get("mtime") is None
             or abs(float(entry.get("mtime")) - float(mtime)) > 1e-4
@@ -153,13 +155,19 @@ class ProbeCache:
             entry = self._get_entry(path, size, mtime)
             if entry is None:
                 return False, None
-            if entry.get("video_frames_unreadable"):
+            if entry.get("video_frames_unreadable") or entry.get("video_flat"):
                 return True, None
+            if "video_flat" not in entry and "video_frames" in entry:
+                return False, None
             if "video_frames" in entry:
                 raw = entry["video_frames"]
                 if raw is None:
                     return True, None
-                return True, [int(h) if h is not None else None for h in raw]
+                hashes = [int(h) if h is not None else None for h in raw]
+                non_none = [h for h in hashes if h is not None]
+                if non_none and all(h == 0 for h in non_none):
+                    return False, None
+                return True, hashes
             return False, None
         except Exception:
             return False, None
@@ -170,13 +178,17 @@ class ProbeCache:
         size: int,
         mtime: float,
         result: Optional[List[Optional[int]]],
+        is_flat: bool = False,
     ) -> None:
         if self.no_cache:
             return
         try:
             with self._lock:
                 entry = self._ensure_entry(path, size, mtime)
-                if result is None:
+                entry["video_flat"] = is_flat
+                if is_flat:
+                    entry["video_frames"] = None
+                elif result is None:
                     entry["video_frames_unreadable"] = True
                     entry["video_frames"] = None
                 else:
@@ -196,13 +208,18 @@ class ProbeCache:
             entry = self._get_entry(path, size, mtime)
             if entry is None:
                 return False, None
-            if entry.get("image_unreadable"):
+            if entry.get("image_unreadable") or entry.get("image_flat"):
                 return True, None
+            if "image_flat" not in entry and "image" in entry:
+                return False, None
             if "image" in entry:
                 val = entry["image"]
                 if val is None:
                     return True, None
-                return True, (int(val[0]), int(val[1]))
+                h = int(val[0])
+                if h == 0 or h == (1 << 64) - 1:
+                    return False, None
+                return True, (h, int(val[1]))
             return False, None
         except Exception:
             return False, None
@@ -213,13 +230,17 @@ class ProbeCache:
         size: int,
         mtime: float,
         result: Optional[Tuple[int, int]],
+        is_flat: bool = False,
     ) -> None:
         if self.no_cache:
             return
         try:
             with self._lock:
                 entry = self._ensure_entry(path, size, mtime)
-                if result is None:
+                entry["image_flat"] = is_flat
+                if is_flat:
+                    entry["image"] = None
+                elif result is None:
                     entry["image_unreadable"] = True
                     entry["image"] = None
                 else:
@@ -280,15 +301,20 @@ class ProbeCache:
         tmp_path = None
         try:
             with self._lock:
-                if len(self._data) > MAX_CACHE_ENTRIES:
+                entry_keys = [
+                    k for k in self._data.keys()
+                    if k != "_version" and isinstance(self._data[k], dict)
+                ]
+                if len(entry_keys) > MAX_CACHE_ENTRIES:
                     sorted_keys = sorted(
-                        self._data.keys(),
+                        entry_keys,
                         key=lambda k: self._data[k].get("last_used", 0.0),
                     )
-                    to_remove = len(self._data) - MAX_CACHE_ENTRIES
+                    to_remove = len(entry_keys) - MAX_CACHE_ENTRIES
                     for k in sorted_keys[:to_remove]:
                         del self._data[k]
 
+                self._data["_version"] = CACHE_VERSION
                 self.cache_dir.mkdir(parents=True, exist_ok=True)
                 fd, tmp_path = tempfile.mkstemp(
                     prefix="probe_cache_",

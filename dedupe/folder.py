@@ -57,9 +57,10 @@ def run_folder_pass(
                 and not is_symlink_or_junction(Path(dirpath) / sub)
             ]
             for f in filenames:
-                fp = (Path(dirpath) / f).resolve()
-                if is_symlink_or_junction(fp):
+                raw_fp = Path(dirpath) / f
+                if is_symlink_or_junction(raw_fp):
                     continue
+                fp = raw_fp.resolve()
                 try:
                     st = fp.stat()
                 except OSError:

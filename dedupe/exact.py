@@ -43,9 +43,10 @@ def run_exact_pass(
             continue
 
         for f in filenames:
-            fp = (curr_dir / f).resolve()
-            if is_symlink_or_junction(fp):
+            raw_fp = curr_dir / f
+            if is_symlink_or_junction(raw_fp):
                 continue
+            fp = raw_fp.resolve()
             if any(fp == rf or rf in fp.parents for rf in removed_folders):
                 continue
 

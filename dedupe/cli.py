@@ -11,6 +11,11 @@ from dedupe.core import HashCache, HeartbeatMonitor, ProgressReporter, Removal, 
 from dedupe.exact import run_exact_pass
 from dedupe.folder import run_folder_pass
 from dedupe.fuzzy import run_fuzzy_pass
+from dedupe.similar import (
+    DEFAULT_IMAGE_DISTANCE,
+    DEFAULT_TEXT_SIMILARITY,
+    run_similar_pass,
+)
 from dedupe.video import run_video_pass
 
 
@@ -49,6 +54,33 @@ def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
         type=int,
         default=10,
         help="Minimum common substring length in normalized stems for fuzzy matching (default: 10; 0 disables)",
+    )
+    parser.add_argument(
+        "--no-similar",
+        action="store_true",
+        help="Skip the similar pass (near-duplicate images and documents)",
+    )
+    parser.add_argument(
+        "--review",
+        action="store_true",
+        help="List near-duplicates as SIMILAR lines instead of removing them",
+    )
+    parser.add_argument(
+        "--delete-similar",
+        action="store_true",
+        help="Remove near-duplicates (the default; accepted for compatibility)",
+    )
+    parser.add_argument(
+        "--image-distance",
+        type=int,
+        default=DEFAULT_IMAGE_DISTANCE,
+        help=f"Max dHash Hamming distance for similar images (default: {DEFAULT_IMAGE_DISTANCE})",
+    )
+    parser.add_argument(
+        "--text-similarity",
+        type=float,
+        default=DEFAULT_TEXT_SIMILARITY,
+        help=f"Min shingle Jaccard for similar documents (default: {DEFAULT_TEXT_SIMILARITY})",
     )
     parser.add_argument(
         "--quiet",

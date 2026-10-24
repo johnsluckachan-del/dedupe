@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 from typing import List
 
-from dedupe.core import HashCache, ProgressReporter, Removal, TrashManager, build_inventory
+from dedupe.core import HashCache, HeartbeatMonitor, ProgressReporter, Removal, TrashManager, build_inventory
 from dedupe.exact import run_exact_pass
 from dedupe.folder import run_folder_pass
 from dedupe.fuzzy import run_fuzzy_pass
@@ -81,57 +81,70 @@ def run_dedupe(
     trash_manager = TrashManager(root=root, dry_run=dry_run, permanent=permanent)
     all_removals: List[Removal] = []
 
-    # Single walk: build the inventory once for all passes.
-    inventory = build_inventory(root, progress=progress)
-    hash_cache = HashCache(inventory=inventory, progress=progress)
+    heartbeat = HeartbeatMonitor(progress)
+    heartbeat.start()
+    try:
+        # Single walk: build the inventory once for all passes.
+        inventory = build_inventory(root, progress=progress, heartbeat=heartbeat)
+        hash_cache = HashCache(inventory=inventory, progress=progress)
 
-    # Pass 1: Duplicate folders
-    progress.set_pass("folder")
-    folder_removals, removed_folders = run_folder_pass(
-        root=root,
-        trash_manager=trash_manager,
-        dry_run=dry_run,
-        permanent=permanent,
-        inventory=inventory,
-        hash_cache=hash_cache,
-        progress=progress,
-    )
-    all_removals.extend(folder_removals)
-
-    # Pass 2: Exact duplicate files across the whole tree
-    progress.set_pass("exact")
-    exact_removals, removed_files = run_exact_pass(
-        root=root,
-        trash_manager=trash_manager,
-        removed_folders=removed_folders,
-        dry_run=dry_run,
-        permanent=permanent,
-        inventory=inventory,
-        hash_cache=hash_cache,
-        progress=progress,
-    )
-    all_removals.extend(exact_removals)
-
-    # Pass 3: Fuzzy-name duplicates in same folder with same extension
-    if not no_fuzzy:
-        progress.set_pass("fuzzy")
-        fuzzy_removals, fuzzy_removed = run_fuzzy_pass(
+        # Pass 1: Duplicate folders
+        progress.set_pass("folder")
+        heartbeat.begin("working on folder")
+        folder_removals, removed_folders = run_folder_pass(
             root=root,
             trash_manager=trash_manager,
-            removed_folders=removed_folders,
-            removed_files=removed_files,
-            threshold=threshold,
-            min_match=min_match,
             dry_run=dry_run,
             permanent=permanent,
             inventory=inventory,
+            hash_cache=hash_cache,
             progress=progress,
         )
-        all_removals.extend(fuzzy_removals)
-        removed_files = removed_files | fuzzy_removed
-        progress.set_pass("video-names")
-        video_removals, video_removed, _leftover = run_video_pass(root=root, trash_manager=trash_manager, removed_folders=removed_folders, removed_files=removed_files, dry_run=dry_run, permanent=permanent, inventory=inventory, progress=progress)
-        all_removals.extend(video_removals)
+        heartbeat.end()
+        all_removals.extend(folder_removals)
+
+        # Pass 2: Exact duplicate files across the whole tree
+        progress.set_pass("exact")
+        heartbeat.begin("working on exact")
+        exact_removals, removed_files = run_exact_pass(
+            root=root,
+            trash_manager=trash_manager,
+            removed_folders=removed_folders,
+            dry_run=dry_run,
+            permanent=permanent,
+            inventory=inventory,
+            hash_cache=hash_cache,
+            progress=progress,
+        )
+        heartbeat.end()
+        all_removals.extend(exact_removals)
+
+        # Pass 3: Fuzzy-name duplicates in same folder with same extension
+        if not no_fuzzy:
+            progress.set_pass("fuzzy")
+            heartbeat.begin("working on fuzzy")
+            fuzzy_removals, fuzzy_removed = run_fuzzy_pass(
+                root=root,
+                trash_manager=trash_manager,
+                removed_folders=removed_folders,
+                removed_files=removed_files,
+                threshold=threshold,
+                min_match=min_match,
+                dry_run=dry_run,
+                permanent=permanent,
+                inventory=inventory,
+                progress=progress,
+            )
+            heartbeat.end()
+            all_removals.extend(fuzzy_removals)
+            removed_files = removed_files | fuzzy_removed
+            progress.set_pass("video-names")
+            heartbeat.begin("working on video-names")
+            video_removals, video_removed, _leftover = run_video_pass(root=root, trash_manager=trash_manager, removed_folders=removed_folders, removed_files=removed_files, dry_run=dry_run, permanent=permanent, inventory=inventory, progress=progress)
+            heartbeat.end()
+            all_removals.extend(video_removals)
+    finally:
+        heartbeat.stop()
 
     # Print one line per removal: action, removed path, kept path, reason
     for r in all_removals:

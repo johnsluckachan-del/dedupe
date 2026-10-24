@@ -6,12 +6,18 @@ import hashlib
 import os
 import shutil
 import sys
+import threading
 import time
 from collections import Counter
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional
 from datetime import datetime
 from pathlib import Path
+
+# Windows reparse-point attribute bit (junctions and symlinks both set it).
+# Read from the DirEntry's cached stat, so detecting it costs no extra
+# network round trip on a directory listing that already returned it.
+_FILE_ATTRIBUTE_REPARSE_POINT = 0x400
 
 
 @dataclass
@@ -34,6 +40,34 @@ def is_symlink_or_junction(path: Path | str) -> bool:
     if hasattr(os.path, "isjunction") and os.path.isjunction(p):
         return True
     return False
+
+
+def _entry_is_symlink_or_junction(entry: "os.DirEntry") -> bool:
+    """Like ``is_symlink_or_junction``, but from a scandir ``DirEntry``.
+
+    Every check here is served from the directory-listing metadata the
+    scandir call already fetched (or, on Windows, from ``DirEntry.stat()``,
+    which is itself cached from that same listing) -- never a fresh
+    lstat/stat/resolve round trip per entry.
+    """
+    try:
+        if entry.is_symlink():
+            return True
+    except OSError:
+        return True
+    is_junction = getattr(entry, "is_junction", None)
+    if is_junction is not None:
+        try:
+            if is_junction():
+                return True
+        except OSError:
+            return True
+        return False
+    try:
+        st = entry.stat(follow_symlinks=False)
+    except OSError:
+        return True
+    return bool(getattr(st, "st_file_attributes", 0) & _FILE_ATTRIBUTE_REPARSE_POINT)
 
 
 def hash_file(path: Path, chunk_size: int = 65536) -> str:
@@ -70,6 +104,7 @@ class ProgressReporter:
         self.duplicates_found = 0
         self.current_pass = "walk"
         self._overwrote = False
+        self._write_lock = threading.Lock()
 
     @property
     def stream(self):
@@ -82,11 +117,14 @@ class ProgressReporter:
             return False
 
     def _write(self, text: str) -> None:
-        try:
-            self.stream.write(text)
-            self.stream.flush()
-        except Exception:
-            pass
+        # Heartbeat lines come from a background thread while the main
+        # thread may be writing status/done lines; keep each line whole.
+        with self._write_lock:
+            try:
+                self.stream.write(text)
+                self.stream.flush()
+            except Exception:
+                pass
 
     def start(self, path) -> None:
         self.start_time = time.monotonic()
@@ -145,6 +183,67 @@ class ProgressReporter:
             f"{self.duplicates_found:,} duplicates found\n"
         )
 
+    def heartbeat(self, label: str, elapsed: float) -> None:
+        """A '(still ...)' line printed by HeartbeatMonitor's background thread."""
+        if self.quiet:
+            return
+        self._write(f"(still {label}, {elapsed:.0f}s)\n")
+
+
+class HeartbeatMonitor:
+    """Prints '(still ...)' lines on a background thread while a single
+    slow call (a directory listing on a network share, a slow pass) would
+    otherwise leave the progress output silent for a long time.
+
+    Usage: wrap the slow section with ``begin(label)``/``end()``; a daemon
+    thread polls roughly every half second and emits a line through the
+    reporter at most once per ``interval`` seconds for the active label.
+    """
+
+    def __init__(self, progress: ProgressReporter, interval: float = 2.5, poll: float = 0.5):
+        self.progress = progress
+        self.interval = interval
+        self.poll = poll
+        self._lock = threading.Lock()
+        self._label: Optional[str] = None
+        self._started_at: Optional[float] = None
+        self._next_due: Optional[float] = None
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self) -> None:
+        if self.progress.quiet or self._thread is not None:
+            return
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+
+    def begin(self, label: str) -> None:
+        with self._lock:
+            self._label = label
+            self._started_at = time.monotonic()
+            self._next_due = self._started_at + self.interval
+
+    def end(self) -> None:
+        with self._lock:
+            self._label = None
+            self._started_at = None
+            self._next_due = None
+
+    def _loop(self) -> None:
+        while not self._stop.wait(self.poll):
+            with self._lock:
+                label, started, due = self._label, self._started_at, self._next_due
+                now = time.monotonic()
+                if label is None or started is None or due is None or now < due:
+                    continue
+                self._next_due = now + self.interval
+            self.progress.heartbeat(label, now - started)
+
 
 @dataclass
 class FileInfo:
@@ -167,35 +266,64 @@ class Inventory:
         self.total_bytes: int = sum(f.size for f in self.files)
 
 
-def build_inventory(root: Path, progress: Optional[ProgressReporter] = None) -> Inventory:
-    """Walk the tree once, collecting (path, size, mtime) for every file."""
-    root = Path(root).resolve()
+def build_inventory(
+    root: Path,
+    progress: Optional[ProgressReporter] = None,
+    heartbeat: Optional["HeartbeatMonitor"] = None,
+) -> Inventory:
+    """Walk the tree once, collecting (path, size, mtime) for every file.
+
+    Uses the directory-listing metadata from ``os.scandir`` (the DirEntry's
+    cached attributes/stat) instead of a per-file lstat/stat/resolve, so a
+    slow network share pays for one round trip per directory, not several
+    per file. The root is made absolute once; every child path is built by
+    joining onto it, never by resolving.
+    """
+    root = Path(os.path.abspath(os.fspath(root)))
     files: List[FileInfo] = []
     dirs: List[Path] = []
     if progress is not None:
         progress.current_pass = "walk"
-    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
-        dirnames[:] = [
-            d
-            for d in dirnames
-            if d != "_dedupe_trash"
-            and not is_symlink_or_junction(Path(dirpath) / d)
-        ]
-        curr_dir = Path(dirpath).resolve()
-        if curr_dir != root:
-            dirs.append(curr_dir)
-        for name in filenames:
-            raw_fp = Path(dirpath) / name
-            if is_symlink_or_junction(raw_fp):
+
+    stack: List[Path] = [root]
+    while stack:
+        current = stack.pop()
+        rel = "." if current == root else current.relative_to(root).as_posix()
+        if heartbeat is not None:
+            heartbeat.begin(f"listing {rel}")
+        try:
+            entries = list(os.scandir(current))
+        except OSError:
+            # Unreadable folder (permissions, a dropped network share, ...):
+            # skip it and keep walking the rest of the tree.
+            continue
+        finally:
+            if heartbeat is not None:
+                heartbeat.end()
+
+        for entry in entries:
+            if entry.name == "_dedupe_trash":
                 continue
-            fp = raw_fp.resolve()
+            if _entry_is_symlink_or_junction(entry):
+                continue
             try:
-                st = fp.stat()
+                is_dir = entry.is_dir(follow_symlinks=False)
             except OSError:
                 continue
-            files.append(FileInfo(path=fp, size=st.st_size, mtime=st.st_mtime))
-            if progress is not None:
-                progress.note_file(st.st_size)
+            if is_dir:
+                child = Path(entry.path)
+                dirs.append(child)
+                stack.append(child)
+            else:
+                try:
+                    st = entry.stat(follow_symlinks=False)
+                except OSError:
+                    continue
+                fp = Path(entry.path)
+                files.append(FileInfo(path=fp, size=st.st_size, mtime=st.st_mtime))
+                if progress is not None:
+                    progress.note_file(st.st_size)
+
     inv = Inventory(root=root, files=files, dirs=dirs)
     if progress is not None:
         # Inventory totals are authoritative even if no status line was emitted.

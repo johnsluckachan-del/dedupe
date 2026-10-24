@@ -23,7 +23,7 @@ from dedupe.similar import (
 from dedupe.video import run_video_pass
 
 
-def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="dedupe",
         description="Dedupe CLI: delete duplicate files/folders with fuzzy-name matching",
@@ -102,7 +102,7 @@ def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
         "--cache-dir",
         type=Path,
         default=None,
-        help="Custom probe cache directory (default: %LOCALAPPDATA%\\dedupe\\cache or ~/.cache/dedupe)",
+        help="Custom probe cache directory (default: %%LOCALAPPDATA%%\\dedupe\\cache or ~/.cache/dedupe)",
     )
     parser.add_argument(
         "--no-cache",
@@ -114,7 +114,14 @@ def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Suppress progress output on stderr",
     )
-    return parser.parse_args(argv)
+    return parser
+
+
+def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
+    return build_parser().parse_args(argv)
+
+
+create_parser = build_parser
 
 
 def run_dedupe(

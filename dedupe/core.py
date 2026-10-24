@@ -104,6 +104,8 @@ class ProgressReporter:
         self.duplicates_found = 0
         self.similar_found = 0
         self.current_pass = "walk"
+        self._similar_totals: Dict[str, int] = {}
+        self._similar_done: Dict[str, int] = {}
         self._overwrote = False
         self._write_lock = threading.Lock()
 
@@ -137,11 +139,45 @@ class ProgressReporter:
             return
         self._write(f"Scanning {path} ...\n")
 
+    def set_similar_totals(
+        self,
+        videos: int = 0,
+        images: int = 0,
+        documents: int = 0,
+    ) -> None:
+        with self._write_lock:
+            self._similar_totals = {
+                "videos": videos,
+                "images": images,
+                "documents": documents,
+            }
+            self._similar_done = {
+                "videos": 0,
+                "images": 0,
+                "documents": 0,
+            }
+
+    def note_similar_done(self, kind: str, count: int = 1) -> None:
+        with self._write_lock:
+            if kind in self._similar_done:
+                self._similar_done[kind] += count
+        self.maybe_status()
+
     def _format_status(self) -> str:
-        return (
+        base = (
             f"[{self.current_pass}] {self.files_found:,} files scanned, "
             f"{self.duplicates_found:,} duplicates found"
         )
+        if self.current_pass == "similar" and self._similar_totals:
+            kinds_str = []
+            for kind in ("videos", "images", "documents"):
+                total = self._similar_totals.get(kind, 0)
+                if total > 0:
+                    done = min(self._similar_done.get(kind, 0), total)
+                    kinds_str.append(f"{kind} {done:,}/{total:,}")
+            if kinds_str:
+                base += " | " + ", ".join(kinds_str)
+        return base
 
     def set_pass(self, name: str) -> None:
         with self._write_lock:
@@ -152,6 +188,9 @@ class ProgressReporter:
         with self._write_lock:
             if name is not None:
                 self.current_pass = name
+            if self.current_pass == "similar":
+                for kind in self._similar_totals:
+                    self._similar_done[kind] = self._similar_totals[kind]
         self.maybe_status(force=True)
 
     def note_file(self, size: int = 0) -> None:
@@ -202,10 +241,17 @@ class ProgressReporter:
             )
 
     def heartbeat(self, label: str, elapsed: float) -> None:
-        """A '(still ...)' line printed by HeartbeatMonitor's background thread."""
+        """A '(still ...)' heartbeat appended to the normal status line."""
         if self.quiet:
             return
-        self._write(f"(still {label}, {elapsed:.0f}s)\n")
+        if label.startswith("working on ") or label == "working":
+            label_text = "working"
+        else:
+            label_text = label
+        with self._write_lock:
+            now = time.monotonic()
+            self._last_status = now
+            self._write_unlocked(f"{self._format_status()} (still {label_text}, {elapsed:.0f}s)\n")
 
 
 class HeartbeatMonitor:
@@ -258,6 +304,8 @@ class HeartbeatMonitor:
                 label, started, due = self._label, self._started_at, self._next_due
                 now = time.monotonic()
                 if label is None or started is None or due is None or now < due:
+                    continue
+                if (now - self.progress._last_status) < (self.interval - self.poll):
                     continue
                 self._next_due = now + self.interval
             self.progress.heartbeat(label, now - started)

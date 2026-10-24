@@ -235,7 +235,8 @@ def run_dedupe(
 
         # Pass 4: near-duplicate images and documents, on this PC only
         if not no_similar:
-            heartbeat.begin("working on similar")
+            progress.set_pass("similar")
+            heartbeat.begin("working")
             similar_removals, _similar_removed, similar_matches = run_similar_pass(
                 root=root,
                 trash_manager=trash_manager,

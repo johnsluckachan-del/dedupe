@@ -90,6 +90,46 @@ class TestProgressAndHashing(unittest.TestCase):
                 self.assertEqual(run_dedupe(str(self.root), dry_run=True), 0)
         self.assertEqual(dict(counts), {})
 
+    def test_similar_status_line_counters(self):
+        self._write("doc1.txt", "some unique text for doc 1")
+        self._write("doc2.txt", "some unique text for doc 2")
+        out, err = io.StringIO(), io.StringIO()
+        with patch("sys.stdout", out), patch("sys.stderr", err):
+            ret = run_dedupe(str(self.root), dry_run=True)
+        self.assertEqual(ret, 0)
+        lines = [l for l in err.getvalue().splitlines() if l.startswith("[similar]")]
+        self.assertTrue(lines)
+        last_similar = lines[-1]
+        self.assertIn("documents 2/2", last_similar)
+        self.assertNotIn("videos", last_similar)
+        self.assertNotIn("images", last_similar)
+
+    def test_heartbeat_appended_to_status_line(self):
+        stream = io.StringIO()
+        reporter = core.ProgressReporter(stream=stream)
+        reporter.files_found = 10
+        reporter.heartbeat("listing mydir", 4.2)
+        lines = stream.getvalue().splitlines()
+        self.assertEqual(len(lines), 1)
+        self.assertEqual(lines[0], "[walk] 10 files scanned, 0 duplicates found (still listing mydir, 4s)")
+
+    def test_heartbeat_working_appended_to_similar_status_line(self):
+        stream = io.StringIO()
+        reporter = core.ProgressReporter(stream=stream)
+        reporter.set_pass("similar")
+        reporter.files_found = 50
+        reporter.set_similar_totals(videos=10, images=20, documents=5)
+        reporter.note_similar_done("videos", 3)
+        stream.truncate(0)
+        stream.seek(0)
+        reporter.heartbeat("working on similar", 12.8)
+        lines = stream.getvalue().splitlines()
+        self.assertEqual(len(lines), 1)
+        self.assertEqual(
+            lines[0],
+            "[similar] 50 files scanned, 0 duplicates found | videos 3/10, images 0/20, documents 0/5 (still working, 13s)",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

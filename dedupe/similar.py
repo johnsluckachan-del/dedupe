@@ -552,6 +552,13 @@ def run_similar_pass(
     for paths in documents.values():
         paths.sort(key=lambda p: p.as_posix())
 
+    if progress is not None:
+        progress.set_similar_totals(
+            videos=len(videos),
+            images=len(images),
+            documents=sum(len(p) for p in documents.values()),
+        )
+
     def _depth(p: Path) -> int:
         try:
             return len(p.relative_to(root).parts)
@@ -595,6 +602,8 @@ def run_similar_pass(
             have_pillow = False
         if not have_pillow:
             _warn("image similarity skipped: Pillow not installed")
+            if progress is not None:
+                progress.note_similar_done("images", len(images))
         else:
             images_to_hash: List[Path] = []
             for fp in images:
@@ -605,6 +614,8 @@ def run_similar_pass(
                     if hit:
                         if res is not None:
                             image_hash[fp], image_pixels[fp] = res
+                        if progress is not None:
+                            progress.note_similar_done("images")
                         continue
                 images_to_hash.append(fp)
 
@@ -624,7 +635,7 @@ def run_similar_pass(
                                 fp, size_of.get(fp, 0), mtime_of.get(fp, 0.0), res
                             )
                         if progress is not None:
-                            progress.maybe_status()
+                            progress.note_similar_done("images")
                 else:
                     for fp in images_to_hash:
                         res = dhash_image(fp)
@@ -635,7 +646,10 @@ def run_similar_pass(
                                 fp, size_of.get(fp, 0), mtime_of.get(fp, 0.0), res
                             )
                         if progress is not None:
-                            progress.maybe_status()
+                            progress.note_similar_done("images")
+    else:
+        if progress is not None and images:
+            progress.note_similar_done("images", len(images))
 
     hashed_images = [fp for fp in images if fp in image_hash]
     image_groups: List[List[Path]] = []
@@ -695,6 +709,12 @@ def run_similar_pass(
     for suffix in sorted(documents):
         paths = documents[suffix]
         if len(paths) < 2:
+            if progress is not None:
+                progress.note_similar_done("documents", len(paths))
+            continue
+        if suffix == ".pdf" and not have_pypdf:
+            if progress is not None:
+                progress.note_similar_done("documents", len(paths))
             continue
         docs_to_read: List[Path] = []
         for fp in paths:
@@ -705,6 +725,8 @@ def run_similar_pass(
                 if hit:
                     if res is not None:
                         shingles_of[fp] = res
+                    if progress is not None:
+                        progress.note_similar_done("documents")
                     continue
             docs_to_read.append(fp)
 
@@ -724,7 +746,7 @@ def run_similar_pass(
                             fp, size_of.get(fp, 0), mtime_of.get(fp, 0.0), res
                         )
                     if progress is not None:
-                        progress.maybe_status()
+                        progress.note_similar_done("documents")
             else:
                 for fp in docs_to_read:
                     res = document_shingles(fp, suffix)
@@ -735,7 +757,7 @@ def run_similar_pass(
                             fp, size_of.get(fp, 0), mtime_of.get(fp, 0.0), res
                         )
                     if progress is not None:
-                        progress.maybe_status()
+                        progress.note_similar_done("documents")
 
         readable = [fp for fp in paths if fp in shingles_of]
         if len(readable) < 2:
@@ -792,6 +814,8 @@ def run_similar_pass(
     if len(videos) >= 2:
         if not _have_ffmpeg_tools():
             _warn("video similarity skipped: ffmpeg not found")
+            if progress is not None:
+                progress.note_similar_done("videos", len(videos))
         else:
             probe: Dict[Path, Tuple[float, int, int]] = {}
             videos_to_probe: List[Path] = []
@@ -803,6 +827,8 @@ def run_similar_pass(
                     if hit:
                         if res is not None:
                             probe[fp] = res
+                        if progress is not None:
+                            progress.note_similar_done("videos")
                         continue
                 videos_to_probe.append(fp)
 
@@ -822,7 +848,7 @@ def run_similar_pass(
                                 fp, size_of.get(fp, 0), mtime_of.get(fp, 0.0), res
                             )
                         if progress is not None:
-                            progress.maybe_status()
+                            progress.note_similar_done("videos")
                 else:
                     for fp in videos_to_probe:
                         res = probe_video(fp)
@@ -833,7 +859,7 @@ def run_similar_pass(
                                 fp, size_of.get(fp, 0), mtime_of.get(fp, 0.0), res
                             )
                         if progress is not None:
-                            progress.maybe_status()
+                            progress.note_similar_done("videos")
 
             probed = [fp for fp in videos if fp in probe]
 
@@ -905,6 +931,9 @@ def run_similar_pass(
             video_groups = _groups_from(uf, probed)
             video_groups = [[p for p in g if p in video_hashes] for g in video_groups]
             video_groups = [g for g in video_groups if len(g) >= 2]
+    else:
+        if progress is not None and videos:
+            progress.note_similar_done("videos", len(videos))
 
     def _video_keeper_key(p: Path):
         return (-video_pixels.get(p, 0), -size_of.get(p, 0), _depth(p), _rel_posix(p))

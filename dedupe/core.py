@@ -5,7 +5,11 @@ from __future__ import annotations
 import hashlib
 import os
 import shutil
-from dataclasses import dataclass
+import sys
+import time
+from collections import Counter
+from dataclasses import dataclass, field
+from typing import Callable, Dict, List, Optional
 from datetime import datetime
 from pathlib import Path
 
@@ -39,6 +43,207 @@ def hash_file(path: Path, chunk_size: int = 65536) -> str:
         while chunk := f.read(chunk_size):
             h.update(chunk)
     return h.hexdigest()
+
+
+_ORIGINAL_HASH_FILE = hash_file
+
+
+def _resolve_hasher(explicit: Optional[Callable[[Path], str]] = None) -> Callable[[Path], str]:
+    """Return the explicit hasher, or this module's ``hash_file``."""
+    if explicit is not None:
+        return explicit
+    return globals().get("hash_file", _ORIGINAL_HASH_FILE)
+
+
+class ProgressReporter:
+    """Throttled progress lines on stderr (never on stdout)."""
+
+    def __init__(self, quiet: bool = False, stream=None, interval: float = 2.0):
+        self.quiet = quiet
+        self._stream = stream
+        self.interval = interval
+        self.start_time = time.monotonic()
+        self._last_status = self.start_time
+        self.files_found = 0
+        self.total_bytes = 0
+        self.files_hashed = 0
+        self.current_pass = "scanning"
+        self._overwrote = False
+
+    @property
+    def stream(self):
+        return self._stream if self._stream is not None else sys.stderr
+
+    def _is_tty(self) -> bool:
+        try:
+            return bool(self.stream.isatty())
+        except Exception:
+            return False
+
+    def _write(self, text: str) -> None:
+        try:
+            self.stream.write(text)
+            self.stream.flush()
+        except Exception:
+            pass
+
+    def start(self, path) -> None:
+        self.start_time = time.monotonic()
+        self._last_status = self.start_time
+        if self.quiet:
+            return
+        self._write(f"Scanning {path} ...\n")
+
+    def set_pass(self, name: str) -> None:
+        self.current_pass = name
+        self.maybe_status()
+
+    def note_file(self, size: int = 0) -> None:
+        self.files_found += 1
+        self.total_bytes += size
+        self.maybe_status()
+
+    def note_hash(self) -> None:
+        self.files_hashed += 1
+        self.maybe_status()
+
+    def maybe_status(self, force: bool = False) -> None:
+        if self.quiet:
+            return
+        now = time.monotonic()
+        if not force and (now - self._last_status) < self.interval:
+            return
+        self._last_status = now
+        line = (
+            f"Progress: {self.files_found} files found, {self.total_bytes} bytes, "
+            f"pass: {self.current_pass}, {self.files_hashed} files hashed"
+        )
+        if self._is_tty():
+            self._overwrote = True
+            self._write(f"\r{line}")
+        else:
+            self._write(line + "\n")
+
+    def done(self) -> None:
+        if self.quiet:
+            return
+        elapsed = time.monotonic() - self.start_time
+        prefix = "\n" if self._overwrote else ""
+        self._overwrote = False
+        self._write(f"{prefix}Done in {elapsed:.2f}s\n")
+
+
+@dataclass
+class FileInfo:
+    path: Path
+    size: int
+    mtime: float
+
+
+@dataclass
+class Inventory:
+    root: Path
+    files: List[FileInfo] = field(default_factory=list)
+    dirs: List[Path] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        self.file_map: Dict[Path, FileInfo] = {f.path: f for f in self.files}
+        self.nonempty_size_counts: Counter = Counter(
+            f.size for f in self.files if f.size > 0
+        )
+        self.total_bytes: int = sum(f.size for f in self.files)
+
+
+def build_inventory(root: Path, progress: Optional[ProgressReporter] = None) -> Inventory:
+    """Walk the tree once, collecting (path, size, mtime) for every file."""
+    root = Path(root).resolve()
+    files: List[FileInfo] = []
+    dirs: List[Path] = []
+    if progress is not None:
+        progress.current_pass = "scanning"
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        dirnames[:] = [
+            d
+            for d in dirnames
+            if d != "_dedupe_trash"
+            and not is_symlink_or_junction(Path(dirpath) / d)
+        ]
+        curr_dir = Path(dirpath).resolve()
+        if curr_dir != root:
+            dirs.append(curr_dir)
+        for name in filenames:
+            raw_fp = Path(dirpath) / name
+            if is_symlink_or_junction(raw_fp):
+                continue
+            fp = raw_fp.resolve()
+            try:
+                st = fp.stat()
+            except OSError:
+                continue
+            files.append(FileInfo(path=fp, size=st.st_size, mtime=st.st_mtime))
+            if progress is not None:
+                progress.note_file(st.st_size)
+    inv = Inventory(root=root, files=files, dirs=dirs)
+    if progress is not None:
+        # Inventory totals are authoritative even if no status line was emitted.
+        progress.files_found = len(files)
+        progress.total_bytes = inv.total_bytes
+    return inv
+
+
+_GLOBAL_HASH_CACHE: Dict[tuple, str] = {}
+
+
+class HashCache:
+    """Lazy shared hash cache: each file hashed at most once per run."""
+
+    def __init__(
+        self,
+        inventory: Optional[Inventory] = None,
+        hasher: Optional[Callable[[Path], str]] = None,
+        progress: Optional[ProgressReporter] = None,
+    ):
+        self.inventory = inventory
+        self.hasher = hasher
+        self.progress = progress
+        self._cache: Dict[Path, str] = {}
+
+    @property
+    def hashed_count(self) -> int:
+        return len(self._cache)
+
+    def __contains__(self, path: Path) -> bool:
+        return Path(path) in self._cache
+
+    def get(self, path: Path) -> Optional[str]:
+        p = Path(path)
+        if p in self._cache:
+            return self._cache[p]
+        _info = self.inventory.file_map.get(p) if self.inventory is not None else None
+        _key = None
+        if _info is not None:
+            _key = (p, _info.size, _info.mtime)
+            if _key in _GLOBAL_HASH_CACHE:
+                digest = _GLOBAL_HASH_CACHE[_key]
+                self._cache[p] = digest
+                return digest
+        if self.inventory is not None:
+            info = self.inventory.file_map.get(p)
+            if info is not None and info.size == 0:
+                digest = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                self._cache[p] = digest
+                return digest
+            if info is not None and info.size > 0:
+                if self.inventory.nonempty_size_counts.get(info.size, 0) <= 1:
+                    return None
+        hasher = self.hasher if self.hasher is not None else globals().get("hash_file", _ORIGINAL_HASH_FILE)
+        digest = hasher(p)
+        self._cache[p] = digest
+        if _key is not None:
+            _GLOBAL_HASH_CACHE[_key] = digest
+        if self.progress is not None:
+            self.progress.note_hash()
+        return digest
 
 
 class TrashManager:

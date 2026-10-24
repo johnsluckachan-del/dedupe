@@ -3,12 +3,29 @@
 from __future__ import annotations
 
 import difflib
-import os
 import re
 from pathlib import Path
-from typing import Dict, List, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
-from dedupe.core import Removal, TrashManager, is_symlink_or_junction
+from dedupe.core import (
+    Inventory,
+    ProgressReporter,
+    Removal,
+    TrashManager,
+    build_inventory,
+    is_symlink_or_junction,
+)
+
+__all__ = [
+    "check_copy_marker",
+    "strip_copy_markers",
+    "normalize_stem",
+    "differ_only_in_digits",
+    "fuzzy_keeper_key",
+    "UnionFind",
+    "run_fuzzy_pass",
+    "is_symlink_or_junction",
+]
 
 PREFIX_COPY_RE = re.compile(
     r"^(?:copy(?:\s*\(\d+\)|\s+\d+)?\s+of\s+)+", re.IGNORECASE
@@ -65,6 +82,15 @@ def fuzzy_keeper_key(p: Path) -> Tuple[int, float, int, str]:
     return (has_marker, -mtime, len(p.name), p.name)
 
 
+def _fuzzy_key(inventory: Optional[Inventory], p: Path) -> Tuple[int, float, int, str]:
+    if inventory is not None:
+        info = inventory.file_map.get(p)
+        if info is not None:
+            has_marker = 1 if check_copy_marker(p.stem) else 0
+            return (has_marker, -info.mtime, len(p.name), p.name)
+    return fuzzy_keeper_key(p)
+
+
 class UnionFind:
     """Disjoint-set data structure with path compression."""
 
@@ -98,46 +124,33 @@ def run_fuzzy_pass(
     min_match: int = 10,
     dry_run: bool = False,
     permanent: bool = False,
+    *,
+    inventory: Optional[Inventory] = None,
+    progress: Optional[ProgressReporter] = None,
 ) -> Tuple[List[Removal], Set[Path]]:
     """Scan root for fuzzy-name duplicates in the same folder with the same extension."""
     root = root.resolve()
     removals: List[Removal] = []
     fuzzy_removed: Set[Path] = set()
 
-    # Group files by (parent_folder, extension_lowercase)
+    if progress is not None:
+        progress.set_pass("fuzzy")
+    if inventory is None:
+        inventory = build_inventory(root, progress=progress)
+    if progress is not None:
+        progress.files_found = len(inventory.files)
+        progress.total_bytes = inventory.total_bytes
+
     folder_ext_groups: Dict[Tuple[Path, str], List[Path]] = {}
-
-    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
-        dirnames[:] = [
-            d
-            for d in dirnames
-            if d != "_dedupe_trash"
-            and not is_symlink_or_junction(Path(dirpath) / d)
-        ]
-        curr_dir = Path(dirpath).resolve()
-        if any(curr_dir == rf or rf in curr_dir.parents for rf in removed_folders):
+    for info in inventory.files:
+        fp = info.path
+        if any(fp == rf or rf in fp.parents for rf in removed_folders):
             continue
-
-        for f in filenames:
-            raw_fp = Path(dirpath) / f
-            if is_symlink_or_junction(raw_fp):
-                continue
-            fp = raw_fp.resolve()
-            if any(fp == rf or rf in fp.parents for rf in removed_folders):
-                continue
-            if fp in removed_files:
-                continue
-
-            try:
-                st = fp.stat()
-            except OSError:
-                continue
-
-            # Skip zero-byte files
-            if st.st_size == 0:
-                continue
-
-            folder_ext_groups.setdefault((curr_dir, fp.suffix.lower()), []).append(fp)
+        if fp in removed_files:
+            continue
+        if info.size == 0:
+            continue
+        folder_ext_groups.setdefault((fp.parent, fp.suffix.lower()), []).append(fp)
 
     action_label = "delete" if permanent else "trash"
     if dry_run:
@@ -146,20 +159,15 @@ def run_fuzzy_pass(
     for (parent_dir, ext), files in folder_ext_groups.items():
         if len(files) < 2:
             continue
-
         n = len(files)
         uf = UnionFind(n)
         norm_stems = [normalize_stem(fp.stem) for fp in files]
-
         for i in range(n):
             for j in range(i + 1, n):
                 s1 = norm_stems[i]
                 s2 = norm_stems[j]
-
-                # Stems that differ only in digits are never duplicates
                 if differ_only_in_digits(s1, s2):
                     continue
-
                 sm = difflib.SequenceMatcher(None, s1, s2)
                 is_match = False
                 if threshold is not None and sm.ratio() >= threshold:
@@ -168,7 +176,6 @@ def run_fuzzy_pass(
                     longest = sm.find_longest_match(0, len(s1), 0, len(s2))
                     if longest.size >= min_match:
                         is_match = True
-
                 if is_match:
                     uf.union(i, j)
 
@@ -177,32 +184,33 @@ def run_fuzzy_pass(
             root_idx = uf.find(idx)
             groups.setdefault(root_idx, []).append(fp)
 
-        # Collect and sort groups to ensure deterministic processing order
         duplicate_groups = [g for g in groups.values() if len(g) >= 2]
         duplicate_groups.sort(
-            key=lambda g: fuzzy_keeper_key(min(g, key=fuzzy_keeper_key))
+            key=lambda g: _fuzzy_key(inventory, min(g, key=lambda p: _fuzzy_key(inventory, p)))
         )
 
         for group_files in duplicate_groups:
-            sorted_group = sorted(group_files, key=fuzzy_keeper_key)
+            sorted_group = sorted(group_files, key=lambda p: _fuzzy_key(inventory, p))
             keeper = sorted_group[0]
-
             for fp in sorted_group[1:]:
                 fuzzy_removed.add(fp)
-                try:
-                    bytes_freed = fp.stat().st_size
-                except OSError:
-                    bytes_freed = 0
-
-                removal = Removal(
-                    action=action_label,
-                    removed_path=fp,
-                    kept_path=keeper,
-                    reason="fuzzy",
-                    bytes_freed=bytes_freed,
-                    is_dir=False,
+                info = inventory.file_map.get(fp)
+                bytes_freed = info.size if info is not None else 0
+                if info is None:
+                    try:
+                        bytes_freed = fp.stat().st_size
+                    except OSError:
+                        bytes_freed = 0
+                removals.append(
+                    Removal(
+                        action=action_label,
+                        removed_path=fp,
+                        kept_path=keeper,
+                        reason="fuzzy",
+                        bytes_freed=bytes_freed,
+                        is_dir=False,
+                    )
                 )
-                removals.append(removal)
                 trash_manager.remove_file(fp)
 
     return removals, fuzzy_removed

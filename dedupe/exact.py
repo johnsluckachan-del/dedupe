@@ -2,18 +2,36 @@
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
-from typing import Dict, List, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
-from dedupe.core import Removal, TrashManager, hash_file, is_symlink_or_junction
+from dedupe.core import (
+    HashCache,
+    Inventory,
+    ProgressReporter,
+    Removal,
+    TrashManager,
+    build_inventory,
+    hash_file,
+    is_symlink_or_junction,
+)
+
+__all__ = ["exact_keeper_key", "run_exact_pass", "is_symlink_or_junction", "hash_file"]
 
 
-def exact_keeper_key(root: Path, p: Path) -> Tuple[int, int, float, str]:
-    """Keeper key: shallowest depth, shortest file name, oldest mtime, alphabetical."""
+def exact_keeper_key(root: Path, p: Path) -> Tuple[int, str, float, int, str]:
+    """Keeper key: shortest file name, alphabetical name, oldest mtime, shallowest depth, alphabetical path."""
     rel = p.relative_to(root)
     mtime = p.stat().st_mtime
-    return (len(rel.parts), len(p.name), mtime, rel.as_posix())
+    return (len(p.name), p.name, mtime, len(rel.parts), rel.as_posix())
+
+
+def _keeper_key(root: Path, inventory: Inventory, p: Path) -> Tuple[int, str, float, int, str]:
+    info = inventory.file_map.get(p)
+    if info is not None:
+        rel = p.relative_to(root)
+        return (len(p.name), p.name, info.mtime, len(rel.parts), rel.as_posix())
+    return exact_keeper_key(root, p)
 
 
 def run_exact_pass(
@@ -22,78 +40,87 @@ def run_exact_pass(
     removed_folders: Set[Path],
     dry_run: bool = False,
     permanent: bool = False,
+    *,
+    inventory: Optional[Inventory] = None,
+    hash_cache: Optional[HashCache] = None,
+    progress: Optional[ProgressReporter] = None,
 ) -> Tuple[List[Removal], Set[Path]]:
     """Scan root for exact duplicate files (same size and SHA-256) and remove duplicates."""
     root = root.resolve()
     removals: List[Removal] = []
     removed_files: Set[Path] = set()
 
-    # Discover files, grouping first by file size
+    if progress is not None:
+        progress.set_pass("exact")
+    if inventory is None:
+        inventory = build_inventory(root, progress=progress)
+    if hash_cache is None:
+        hash_cache = HashCache(inventory=inventory, hasher=hash_file, progress=progress)
+    elif hash_cache.inventory is None:
+        hash_cache.inventory = inventory
+    if hash_cache is not None:
+        hash_cache.hasher = hash_file
+    if progress is not None:
+        progress.files_found = len(inventory.files)
+        progress.total_bytes = inventory.total_bytes
+
     size_groups: Dict[int, List[Path]] = {}
-
-    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
-        dirnames[:] = [
-            d
-            for d in dirnames
-            if d != "_dedupe_trash"
-            and not is_symlink_or_junction(Path(dirpath) / d)
-        ]
-        curr_dir = Path(dirpath).resolve()
-        if any(curr_dir == rf or rf in curr_dir.parents for rf in removed_folders):
+    for info in inventory.files:
+        fp = info.path
+        if any(fp == rf or rf in fp.parents for rf in removed_folders):
             continue
-
-        for f in filenames:
-            raw_fp = curr_dir / f
-            if is_symlink_or_junction(raw_fp):
-                continue
-            fp = raw_fp.resolve()
-            if any(fp == rf or rf in fp.parents for rf in removed_folders):
-                continue
-
-            try:
-                st = fp.stat()
-            except OSError:
-                continue
-
-            # Skip zero-byte files
-            if st.st_size == 0:
-                continue
-
-            size_groups.setdefault(st.st_size, []).append(fp)
+        if info.size == 0:
+            continue
+        size_groups.setdefault(info.size, []).append(fp)
 
     action_label = "delete" if permanent else "trash"
     if dry_run:
         action_label = f"dry-run {action_label}"
 
-    # For each size group with multiple files, compare SHA-256 hashes
     for size, files in size_groups.items():
         if len(files) < 2:
             continue
+        if progress is not None:
+            progress.set_pass("exact")
+        # Pre-filter: only files sharing a first block can be identical,
+        # so a same-size file with a different first block is never hashed.
+        block_groups: Dict[bytes, List[Path]] = {}
+        for fp in files:
+            try:
+                with open(fp, "rb") as fh:
+                    head = fh.read(8192)
+            except OSError:
+                continue
+            block_groups.setdefault(head, []).append(fp)
 
         hash_groups: Dict[str, List[Path]] = {}
-        for fp in files:
-            file_hash = hash_file(fp)
-            hash_groups.setdefault(file_hash, []).append(fp)
+        for head_files in block_groups.values():
+            if len(head_files) < 2:
+                continue
+            for fp in head_files:
+                digest = hash_cache.get(fp)
+                if digest is None:
+                    continue
+                hash_groups.setdefault(digest, []).append(fp)
 
-        for h, matching_files in hash_groups.items():
+        for matching_files in hash_groups.values():
             if len(matching_files) < 2:
                 continue
-
-            keeper = min(matching_files, key=lambda p: exact_keeper_key(root, p))
-
+            keeper = min(matching_files, key=lambda p: _keeper_key(root, inventory, p))
             for fp in matching_files:
                 if fp == keeper:
                     continue
                 removed_files.add(fp)
-                removal = Removal(
-                    action=action_label,
-                    removed_path=fp,
-                    kept_path=keeper,
-                    reason="exact",
-                    bytes_freed=size,
-                    is_dir=False,
+                removals.append(
+                    Removal(
+                        action=action_label,
+                        removed_path=fp,
+                        kept_path=keeper,
+                        reason="exact",
+                        bytes_freed=size,
+                        is_dir=False,
+                    )
                 )
-                removals.append(removal)
                 trash_manager.remove_file(fp)
 
     return removals, removed_files

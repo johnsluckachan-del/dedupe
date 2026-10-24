@@ -24,7 +24,7 @@ __all__ = [
     "fuzzy_keeper_key",
     "UnionFind",
     "run_fuzzy_pass",
-    "is_symlink_or_junction",
+    "is_symlink_or_junction", "extract_episode_code", "extract_year_value", "number_roman_signature", "sequel_episode_guard",
 ]
 
 PREFIX_COPY_RE = re.compile(
@@ -72,6 +72,88 @@ def differ_only_in_digits(s1: str, s2: str) -> bool:
     digits1 = re.findall(r"\d+", s1)
     digits2 = re.findall(r"\d+", s2)
     return clean1 == clean2 and digits1 != digits2
+
+
+ROMAN_VALUES = {
+    "i": 1, "ii": 2, "iii": 3, "iv": 4, "v": 5, "vi": 6, "vii": 7,
+    "viii": 8, "ix": 9, "x": 10, "xi": 11, "xii": 12, "xiii": 13,
+    "xiv": 14, "xv": 15, "xvi": 16, "xvii": 17, "xviii": 18, "xix": 19, "xx": 20,
+}
+
+_EPISODE_SE_RE = re.compile(r"s\s*(\d{1,2})\s*e\s*(\d{1,3})", re.IGNORECASE)
+_EPISODE_X_RE = re.compile(r"\b(\d{1,2})x(\d{1,3})\b", re.IGNORECASE)
+_YEAR_RE = re.compile(r"\b(19\d{2}|20\d{2})\b")
+
+
+def extract_episode_code(text: str):
+    """Return (season, episode) ints from S01E05 / S01 E05 / 1x05, else None."""
+    low = text.lower()
+    m = _EPISODE_SE_RE.search(low)
+    if m:
+        return (int(m.group(1)), int(m.group(2)))
+    m = _EPISODE_X_RE.search(low)
+    if m:
+        return (int(m.group(1)), int(m.group(2)))
+    return None
+
+
+def extract_year_value(text: str):
+    """Return first 19xx/20xx year in text, else None."""
+    m = _YEAR_RE.search(text)
+    return int(m.group(1)) if m else None
+
+
+def number_roman_signature(text: str):
+    """Ordered numeric/roman values in text (sequel numbers, years, resolutions)."""
+    tokens = re.findall(r"[a-z0-9]+", text.lower())
+    sig = []
+    for tok in tokens:
+        if _EPISODE_SE_RE.fullmatch(tok) or _EPISODE_X_RE.fullmatch(tok):
+            continue
+        m = re.fullmatch(r"(?:vol|part|cd|disc|disk)(\d+)", tok)
+        if m:
+            sig.append(int(m.group(1)))
+            continue
+        if tok.isdigit():
+            sig.append(int(tok))
+            continue
+        m = re.fullmatch(r"(\d+)p", tok)
+        if m:
+            sig.append(int(m.group(1)))
+            continue
+        if tok in ROMAN_VALUES:
+            sig.append(ROMAN_VALUES[tok])
+            continue
+    return sig
+
+
+def _guard_key(s: str):
+    return (extract_year_value(s), extract_episode_code(s), tuple(number_roman_signature(s)))
+
+
+def _guarded_keys(k1, k2) -> bool:
+    if k1[0] is not None and k2[0] is not None and k1[0] != k2[0]:
+        return True
+    if (k1[1] is None) != (k2[1] is None):
+        return True
+    if k1[1] is not None and k2[1] is not None and k1[1] != k2[1]:
+        return True
+    return k1[2] != k2[2]
+
+
+def sequel_episode_guard(s1: str, s2: str) -> bool:
+    """True when year/episode/number-roman guards forbid treating s1/s2 as duplicates."""
+    y1, y2 = extract_year_value(s1), extract_year_value(s2)
+    if y1 is not None and y2 is not None and y1 != y2:
+        return True
+    e1, e2 = extract_episode_code(s1), extract_episode_code(s2)
+    if (e1 is None) != (e2 is None):
+        return True
+    if e1 is not None and e2 is not None and e1 != e2:
+        return True
+    if number_roman_signature(s1) != number_roman_signature(s2):
+        return True
+    return False
 
 
 def fuzzy_keeper_key(p: Path) -> Tuple[int, float, int, str]:
@@ -164,11 +246,12 @@ def run_fuzzy_pass(
         n = len(files)
         uf = UnionFind(n)
         norm_stems = [normalize_stem(fp.stem) for fp in files]
+        guard_keys = [_guard_key(s) for s in norm_stems]
         for i in range(n):
             for j in range(i + 1, n):
                 s1 = norm_stems[i]
                 s2 = norm_stems[j]
-                if differ_only_in_digits(s1, s2):
+                if differ_only_in_digits(s1, s2) or _guarded_keys(guard_keys[i], guard_keys[j]):
                     continue
                 sm = difflib.SequenceMatcher(None, s1, s2)
                 is_match = False

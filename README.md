@@ -91,6 +91,25 @@ The tree is walked once and files are hashed lazily through a shared cache: each
 
 ---
 
+## Torrent Video Duplicates (video-names pass)
+
+After the fuzzy pass (and skipped by `--no-fuzzy`), video files (`.mkv`, `.mp4`, `.avi`, `.m4v`, `.mov`, `.wmv`, `.mpg`, `.mpeg`, `.ts`, `.m2ts`, `.mts`, `.webm`, `.flv`, `.3gp`, `.divx`, `.vob`) are compared across the whole tree and across extensions by their parsed release names. Site prefixes (`www.xxx.yyy - `, `[site]`), bracketed groups, release/source/codec/audio/edition/language tags, and trailing `-GROUP` suffixes are stripped; the year, episode code, and resolution are extracted. The keeper is the highest resolution, then the biggest file, then the shallowest path. Removals use reason `video-name`. This pass never prompts and never uses the network.
+
+Examples of what matches (duplicates):
+
+- `The.Movie.2020.720p.WEB-DL.x264.mkv` and `The Movie (2020) [1080p].mp4` — same movie; the 1080p copy is kept.
+- `Show.S01E05.720p.HDTV.mkv` and `Show 1x05 1080p WEB-DL.avi` — same episode; the 1080p copy is kept.
+- `[YTS.MX] Film Name 2019 720p BluRay.mkv` in one torrent folder and `www.site.com - Film.Name.2019.2160p.WEB-DL.mp4` in another — same film; the 2160p copy is kept.
+
+Examples of what never matches:
+
+- Different years: `Film.2019.1080p.mkv` vs `Film.2020.1080p.mkv`.
+- Different episodes: `Show.S01E01.720p.mkv` vs `Show.S01E02.720p.mkv`, or an episode file vs a file with no episode code.
+- Sequels: `Rocky.IV.720p.mkv` vs `Rocky.V.720p.mkv`, `Movie 2` vs `Movie 3`, `Saga Vol 1` vs `Saga Vol 2`, `Film Part 1` vs `Film Part 2`, `Disc CD1` vs `CD2` (these guards also apply to the fuzzy pass).
+- Different movies whose parsed titles are not similar enough (ratio below 0.85).
+
+Samples and leftovers: a video with the token `sample` (or inside a `Sample` folder) that is under 1/10 of the size of a non-sample video in the same torrent folder (or its parent) is removed with reason `sample`. After a video is removed, if its torrent folder (its parent, not the scan root) holds only junk (`.nfo .txt .jpg .jpeg .png .srt .sub .idx .ass .url .sfv .md5 .exe .lnk` files, sample videos, empty folders, or a `Subs`/`Sample` subfolder), the whole folder is removed with reason `torrent-leftover`. A folder holding any other file (for example a document or another non-sample video) is kept. `video-name` and `sample` removals count as duplicates found; `torrent-leftover` folders do not.
+
 ## Safety Notes
 
 - **Always Dry-Run First**: Run with `--dry-run` to preview the planned removals before applying changes:

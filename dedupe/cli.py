@@ -11,6 +11,7 @@ from dedupe.core import HashCache, ProgressReporter, Removal, TrashManager, buil
 from dedupe.exact import run_exact_pass
 from dedupe.folder import run_folder_pass
 from dedupe.fuzzy import run_fuzzy_pass
+from dedupe.video import run_video_pass
 
 
 def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
@@ -114,7 +115,7 @@ def run_dedupe(
     # Pass 3: Fuzzy-name duplicates in same folder with same extension
     if not no_fuzzy:
         progress.set_pass("fuzzy")
-        fuzzy_removals, _ = run_fuzzy_pass(
+        fuzzy_removals, fuzzy_removed = run_fuzzy_pass(
             root=root,
             trash_manager=trash_manager,
             removed_folders=removed_folders,
@@ -127,6 +128,10 @@ def run_dedupe(
             progress=progress,
         )
         all_removals.extend(fuzzy_removals)
+        removed_files = removed_files | fuzzy_removed
+        progress.set_pass("video-names")
+        video_removals, video_removed, _leftover = run_video_pass(root=root, trash_manager=trash_manager, removed_folders=removed_folders, removed_files=removed_files, dry_run=dry_run, permanent=permanent, inventory=inventory, progress=progress)
+        all_removals.extend(video_removals)
 
     # Print one line per removal: action, removed path, kept path, reason
     for r in all_removals:
@@ -145,13 +150,17 @@ def run_dedupe(
     folder_count = sum(1 for r in all_removals if r.reason == "folder")
     exact_count = sum(1 for r in all_removals if r.reason == "exact")
     fuzzy_count = sum(1 for r in all_removals if r.reason == "fuzzy")
+    video_count = sum(1 for r in all_removals if r.reason == "video-name")
+    sample_count = sum(1 for r in all_removals if r.reason == "sample")
+    leftover_count = sum(1 for r in all_removals if r.reason == "torrent-leftover")
+    video_summary_extra = f", {video_count} video-name, {sample_count} sample, {leftover_count} torrent-leftover" if (video_count or sample_count or leftover_count) else ""
     total_count = len(all_removals)
     total_bytes = sum(r.bytes_freed for r in all_removals)
 
     action_word = "would be removed" if dry_run else "removed"
     print(
         f"Summary: {total_count} items {action_word} "
-        f"({folder_count} folder, {exact_count} exact, {fuzzy_count} fuzzy), "
+        f"({folder_count} folder, {exact_count} exact, {fuzzy_count} fuzzy{video_summary_extra}), "
         f"{total_bytes} bytes freed"
     )
 

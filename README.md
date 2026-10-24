@@ -64,7 +64,7 @@ options:
 
 ## Progress Output
 
-Progress is printed to stderr (stdout keeps only the removal lines and summary). The first line is `Scanning <path> ...`, printed and flushed immediately. While walking and hashing, a status line is printed at most every 2 seconds showing files found, bytes, the current pass, and files hashed; on an interactive terminal it may overwrite itself. The last stderr line starts with `Done` and shows the elapsed time. Use `--quiet` to suppress all progress output on stderr (errors are still printed to stderr).
+Progress is printed to stderr (stdout keeps only the removal lines and summary). The first line is `Scanning <path> ...`, printed and flushed immediately. While walking and hashing, a status line is printed at most every 2 seconds; one status line is always printed at the end of each pass (`walk`, `folder`, `exact`, `fuzzy`). Every status line shows both running counters plus the current pass name, for example `[exact] 12,345 files scanned, 37 duplicates found`. `files scanned` counts every file found by the walk (including zero-byte files; `_dedupe_trash` and symlinks/junctions excluded) and `duplicates found` counts removals planned or done so far (one per duplicate folder, one per duplicate file; never goes down). The last stderr line shows the elapsed time with the final totals, for example `Done in 1.23s: 12,345 files scanned, 37 duplicates found`. Use `--quiet` to suppress all progress output on stderr (errors are still printed to stderr).
 
 The tree is walked once and files are hashed lazily through a shared cache: each file is hashed at most once per run, and a file whose size is unique among non-empty files is never hashed. Note that the first run on a big network share still reads every file that has a same-size twin.
 
@@ -84,7 +84,7 @@ The tree is walked once and files are hashed lazily through a shared cache: each
 3. **Pass 3 - Fuzzy-Name Duplicate Files**:
    - Skipped if `--no-fuzzy` is specified. Zero-byte files are skipped.
    - Compares files only within the **same folder** and having the **same extension** (case-insensitive).
-   - Normalizes stems: converts to lowercase, strips copy markers (`copy of ` prefix, ` (n)` suffix, ` - copy` / ` - copy (n)` suffix, `_copy`/` copy`/`-copy` with optional digits), and collapses whitespace/underscores/hyphens to a single space.
+   - Normalizes stems: converts to lowercase, strips copy markers (`copy of ` prefix, ` (n)` suffix, ` - copy` / ` - copy (n)` suffix, `_copy`/` copy`/`-copy` with optional digits), collapses runs of 3+ identical characters to one (so padded names like `filexxxxxx` do not match on the padding alone), and collapses whitespace/underscores/hyphens to a single space.
    - Matches when EITHER `difflib.SequenceMatcher` ratio of normalized stems >= threshold (default `0.9`) OR the longest common contiguous substring of normalized stems (via `difflib.SequenceMatcher.find_longest_match`) is at least `N` characters (`--min-match N`, default `10`; `0` disables this rule), **except** when stems differ only in digits (which are never duplicates).
    - Matches are transitive: files are grouped using union-find.
    - Keeper selection: one file is kept per group (a file with no copy marker in its name, then newest modification time (`mtime`), then shortest name, then alphabetical order). The printed reason for removals is `fuzzy`.

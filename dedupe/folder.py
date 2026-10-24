@@ -141,6 +141,10 @@ def run_folder_pass(
                 is_dir=True,
             )
             removals.append(removal)
+            if progress is not None:
+                progress.note_duplicate()
             trash_manager.remove_folder(d)
 
+    if progress is not None:
+        progress.end_pass("folder")
     return removals, removed_folders

@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dedupe"
+version = "0.1.0"
+description = "CLI to delete duplicate files and folders with fuzzy-name matching"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = []
+
+[project.scripts]
+dedupe = "dedupe.cli:main"

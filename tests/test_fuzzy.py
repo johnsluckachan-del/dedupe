@@ -109,6 +109,91 @@ class TestFuzzyPass(unittest.TestCase):
 
         self.assertEqual(len(removals), 0)
 
+    def test_min_match_character_overlap(self):
+        now = time.time()
+        # "Quarterly Sales Report Draft" and "Quarterly Sales Report Final" share 23 chars
+        draft = self._write("Quarterly Sales Report Draft.xlsx", "v1", mtime=now - 100)
+        final = self._write("Quarterly Sales Report Final.xlsx", "v2", mtime=now)
+
+        tm = TrashManager(self.root)
+        removals, removed = run_fuzzy_pass(
+            self.root, tm, removed_folders=set(), removed_files=set(), min_match=10
+        )
+
+        self.assertEqual(len(removals), 1)
+        self.assertEqual(removals[0].kept_path, final)
+        self.assertEqual(removals[0].removed_path, draft)
+
+    def test_min_match_custom_limits(self):
+        now = time.time()
+        f1 = self._write("project_alpha_summary.txt", "1", mtime=now - 50)
+        f2 = self._write("project_alpha_details.txt", "2", mtime=now)
+
+        tm = TrashManager(self.root)
+        # Stems share "project alpha " (14 chars)
+        # With min_match=15, 14 < 15, should not match (SequenceMatcher ratio: 28/43 = 0.65 < 0.9)
+        removals, _ = run_fuzzy_pass(
+            self.root, tm, removed_folders=set(), removed_files=set(), min_match=15
+        )
+        self.assertEqual(len(removals), 0)
+
+        # With min_match=12, 14 >= 12, should match
+        removals, _ = run_fuzzy_pass(
+            self.root, tm, removed_folders=set(), removed_files=set(), min_match=12
+        )
+        self.assertEqual(len(removals), 1)
+        self.assertEqual(removals[0].kept_path, f2)
+        self.assertEqual(removals[0].removed_path, f1)
+
+    def test_min_match_zero_disables_rule(self):
+        self._write("Quarterly Sales Report Draft.xlsx", "draft")
+        self._write("Quarterly Sales Report Final.xlsx", "final")
+
+        tm = TrashManager(self.root)
+        removals, _ = run_fuzzy_pass(
+            self.root, tm, removed_folders=set(), removed_files=set(), min_match=0
+        )
+        self.assertEqual(len(removals), 0)
+
+    def test_union_find_transitive_matches(self):
+        now = time.time()
+        # beach, city, and mountain share "holiday photos " (15 characters)
+        beach = self._write("holiday_photos_beach.jpg", "1", mtime=now - 300)
+        city = self._write("holiday_photos_city.jpg", "2", mtime=now)
+        mountain = self._write("holiday_photos_mountain.jpg", "3", mtime=now - 100)
+
+        tm = TrashManager(self.root)
+        removals, _ = run_fuzzy_pass(
+            self.root, tm, removed_folders=set(), removed_files=set(), min_match=10
+        )
+
+        self.assertEqual(len(removals), 2)
+        kept_paths = {r.kept_path for r in removals}
+        removed_paths = {r.removed_path for r in removals}
+        self.assertEqual(kept_paths, {city})
+        self.assertEqual(removed_paths, {beach, mountain})
+
+    def test_numbered_names_safe_with_min_match(self):
+        # Even though "invoice_2024_00" has 15 chars, stems differ only in digits
+        self._write("invoice_2024_001.pdf", "a")
+        self._write("invoice_2024_002.pdf", "b")
+
+        tm = TrashManager(self.root)
+        removals, _ = run_fuzzy_pass(
+            self.root, tm, removed_folders=set(), removed_files=set(), min_match=10
+        )
+        self.assertEqual(len(removals), 0)
+
+    def test_zero_byte_files_skipped(self):
+        self._write("Quarterly Sales Report Draft.xlsx", "")
+        self._write("Quarterly Sales Report Final.xlsx", "")
+
+        tm = TrashManager(self.root)
+        removals, _ = run_fuzzy_pass(
+            self.root, tm, removed_folders=set(), removed_files=set(), min_match=10
+        )
+        self.assertEqual(len(removals), 0)
+
 
 if __name__ == "__main__":
     unittest.main()

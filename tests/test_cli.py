@@ -25,16 +25,31 @@ class TestCLI(unittest.TestCase):
         self.assertFalse(args.permanent)
         self.assertFalse(args.no_fuzzy)
         self.assertAlmostEqual(args.threshold, 0.9)
+        self.assertEqual(args.min_match, 10)
 
     def test_parse_args_flags(self):
         args = parse_args(
-            ["some/path", "--dry-run", "--permanent", "--no-fuzzy", "--threshold", "0.75"]
+            [
+                "some/path",
+                "--dry-run",
+                "--permanent",
+                "--no-fuzzy",
+                "--threshold",
+                "0.75",
+                "--min-match",
+                "15",
+            ]
         )
         self.assertEqual(args.path, "some/path")
         self.assertTrue(args.dry_run)
         self.assertTrue(args.permanent)
         self.assertTrue(args.no_fuzzy)
         self.assertAlmostEqual(args.threshold, 0.75)
+        self.assertEqual(args.min_match, 15)
+
+    def test_parse_args_min_match_zero(self):
+        args = parse_args(["some/path", "--min-match", "0"])
+        self.assertEqual(args.min_match, 0)
 
     def test_nonexistent_path(self):
         bad_path = self.root / "does_not_exist"
@@ -64,7 +79,7 @@ class TestCLI(unittest.TestCase):
         f = self.root / "a.txt"
         f.write_text("unique content")
         with patch("sys.stdout", new_callable=io.StringIO):
-            ret = main([str(self.root), "--dry-run"])
+            ret = main([str(self.root), "--dry-run", "--min-match", "8"])
             self.assertEqual(ret, 0)
 
 

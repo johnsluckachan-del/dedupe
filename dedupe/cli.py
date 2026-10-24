@@ -43,6 +43,12 @@ def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
         default=0.9,
         help="Fuzzy matching ratio threshold (default: 0.9)",
     )
+    parser.add_argument(
+        "--min-match",
+        type=int,
+        default=10,
+        help="Minimum common substring length in normalized stems for fuzzy matching (default: 10; 0 disables)",
+    )
     return parser.parse_args(argv)
 
 
@@ -52,6 +58,7 @@ def run_dedupe(
     permanent: bool = False,
     no_fuzzy: bool = False,
     threshold: float = 0.9,
+    min_match: int = 10,
 ) -> int:
     root = Path(target_path).resolve()
     if not root.exists():
@@ -91,6 +98,7 @@ def run_dedupe(
             removed_folders=removed_folders,
             removed_files=removed_files,
             threshold=threshold,
+            min_match=min_match,
             dry_run=dry_run,
             permanent=permanent,
         )
@@ -134,4 +142,5 @@ def main(argv: List[str] | None = None) -> int:
         permanent=args.permanent,
         no_fuzzy=args.no_fuzzy,
         threshold=args.threshold,
+        min_match=args.min_match,
     )

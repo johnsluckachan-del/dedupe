@@ -68,6 +68,8 @@ Progress is printed to stderr (stdout keeps only the removal lines and summary).
 
 The tree is walked once and files are hashed lazily through a shared cache: each file is hashed at most once per run, and a file whose size is unique among non-empty files is never hashed. Note that the first run on a big network share still reads every file that has a same-size twin.
 
+The walk reads size and modification time straight from the directory listing (no per-file stat/resolve round trips), so a slow network share is fast to scan. If a single directory listing (or another pass) takes a while, a `(still listing <folder>, Ns)` or `(still working on <pass>, Ns)` line is printed every 2-3 seconds until it returns, so the scan never looks stuck; a folder that cannot be listed (permission error, dropped share) is skipped and the walk continues. These heartbeat lines are suppressed by `--quiet` along with the rest of the progress output.
+
 ## Order of Passes
 
 1. **Pass 1 - Duplicate Folders**:

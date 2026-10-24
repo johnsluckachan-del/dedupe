@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import csv
 import difflib
 import re
+from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from dedupe.core import (
     Inventory,
@@ -24,6 +26,8 @@ __all__ = [
     "is_video_file",
     "is_sample_video",
     "run_video_pass",
+    "generate_near_miss_report",
+    "write_empty_report",
 ]
 
 VIDEO_EXTENSIONS = {
@@ -199,18 +203,130 @@ def _is_under(path: Path, folder: Path) -> bool:
     return path == folder or folder in path.parents
 
 
-def _titles_guarded(a: ParsedVideoName, b: ParsedVideoName, sig_a=None, sig_b=None) -> bool:
+def _guard_reason(a: ParsedVideoName, b: ParsedVideoName, sig_a=None, sig_b=None) -> Optional[str]:
     if a.year is not None and b.year is not None and a.year != b.year:
-        return True
+        return "year"
     if (a.episode is None) != (b.episode is None):
-        return True
+        return "episode"
     if a.episode is not None and b.episode is not None and a.episode != b.episode:
-        return True
+        return "episode"
     _sa = sig_a if sig_a is not None else tuple(number_roman_signature(a.title))
     _sb = sig_b if sig_b is not None else tuple(number_roman_signature(b.title))
     if _sa != _sb:
-        return True
-    return False
+        return "number"
+    return None
+
+
+def _titles_guarded(a: ParsedVideoName, b: ParsedVideoName, sig_a=None, sig_b=None) -> bool:
+    return _guard_reason(a, b, sig_a, sig_b) is not None
+
+
+def write_empty_report(report_path: Path | str) -> None:
+    out_file = Path(report_path)
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = ["file_a", "file_b", "title_a", "title_b", "score", "blocked_by"]
+    with open(out_file, "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+
+
+def generate_near_miss_report(
+    root: Path,
+    cands: List[Path],
+    parsed: Dict[Path, ParsedVideoName],
+    uf: UnionFind,
+    report_path: Path | str,
+    sigs: Optional[List[Tuple[int, ...]]] = None,
+    cap_per_title: int = 200,
+) -> List[Dict[str, Any]]:
+    n = len(cands)
+    if sigs is None:
+        sigs = [tuple(number_roman_signature(parsed[fp].title)) for fp in cands]
+
+    word_to_indices: Dict[str, List[int]] = defaultdict(list)
+    file_words: List[Set[str]] = []
+
+    for idx, fp in enumerate(cands):
+        tokens = parsed[fp].title_tokens
+        words = {tok for tok in tokens if len(tok) >= 3}
+        if not words and tokens:
+            words = {tok for tok in tokens if tok}
+        file_words.append(words)
+        for w in words:
+            word_to_indices[w].append(idx)
+
+    pairs_to_evaluate: Set[Tuple[int, int]] = set()
+    for i in range(n):
+        words = file_words[i]
+        sorted_words = sorted(words, key=lambda w: len(word_to_indices[w]))
+        added_for_i = 0
+        for w in sorted_words:
+            for j in word_to_indices[w]:
+                if i == j:
+                    continue
+                pair_key = (i, j) if i < j else (j, i)
+                if pair_key not in pairs_to_evaluate:
+                    pairs_to_evaluate.add(pair_key)
+                    added_for_i += 1
+                    if added_for_i >= cap_per_title:
+                        break
+            if added_for_i >= cap_per_title:
+                break
+
+    rows: List[Dict[str, Any]] = []
+    for i, j in pairs_to_evaluate:
+        if uf.find(i) == uf.find(j):
+            continue
+        p_a, p_b = cands[i], cands[j]
+        name_a, name_b = parsed[p_a], parsed[p_b]
+        score = difflib.SequenceMatcher(None, name_a.title, name_b.title).ratio()
+        if score < 0.5:
+            continue
+        guard = _guard_reason(name_a, name_b, sigs[i], sigs[j])
+        if guard is not None:
+            blocked_by = guard
+        else:
+            blocked_by = "below-threshold"
+
+        try:
+            rel_a = str(p_a.relative_to(root))
+        except ValueError:
+            rel_a = str(p_a)
+        try:
+            rel_b = str(p_b.relative_to(root))
+        except ValueError:
+            rel_b = str(p_b)
+
+        if rel_a > rel_b:
+            file_a, file_b = rel_b, rel_a
+            title_a, title_b = name_b.title, name_a.title
+        else:
+            file_a, file_b = rel_a, rel_b
+            title_a, title_b = name_a.title, name_b.title
+
+        rows.append({
+            "file_a": file_a,
+            "file_b": file_b,
+            "title_a": title_a,
+            "title_b": title_b,
+            "score": f"{score:.3f}",
+            "blocked_by": blocked_by,
+            "_raw_score": score,
+        })
+
+    rows.sort(key=lambda r: (-float(r["score"]), -r["_raw_score"], r["file_a"], r["file_b"]))
+    rows = rows[:500]
+
+    out_file = Path(report_path)
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = ["file_a", "file_b", "title_a", "title_b", "score", "blocked_by"]
+    with open(out_file, "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for r in rows:
+            writer.writerow({k: r[k] for k in fieldnames})
+
+    return rows
 
 
 def run_video_pass(
@@ -223,6 +339,8 @@ def run_video_pass(
     *,
     inventory: Optional[Inventory] = None,
     progress: Optional[ProgressReporter] = None,
+    report: Optional[str | Path] = None,
+    report_rows_out: Optional[List[dict]] = None,
 ) -> Tuple[List[Removal], Set[Path], Set[Path]]:
     """Torrent video pass: sample, video-name duplicates, leftover folders."""
     root = root.resolve()
@@ -342,6 +460,18 @@ def run_video_pass(
             if progress is not None:
                 progress.note_duplicate()
             trash_manager.remove_file(fp)
+
+    if report:
+        near_miss_rows = generate_near_miss_report(
+            root=root,
+            cands=cands,
+            parsed=parsed,
+            uf=uf,
+            report_path=report,
+            sigs=_sigs,
+        )
+        if report_rows_out is not None:
+            report_rows_out.extend(near_miss_rows)
 
     # --- Leftover torrent folders --------------------------------------
     keeper_for: Dict[Path, Path] = {}

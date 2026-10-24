@@ -73,6 +73,7 @@ options:
   --video-distance N    Max per-frame dHash Hamming distance for similar
                         videos (default: 10)
   --quiet               Suppress progress output on stderr
+  --report FILE         Write CSV report of near-miss video name pairs (local file)
 ```
 
 ---
@@ -128,6 +129,21 @@ Examples of what never matches:
 - Different movies whose parsed titles are not similar enough (ratio below 0.85).
 
 Samples and leftovers: a video with the token `sample` (or inside a `Sample` folder) that is under 1/10 of the size of a non-sample video in the same torrent folder (or its parent) is removed with reason `sample`. After a video is removed, if its torrent folder (its parent, not the scan root) holds only junk (`.nfo .txt .jpg .jpeg .png .srt .sub .idx .ass .url .sfv .md5 .exe .lnk` files, sample videos, empty folders, or a `Subs`/`Sample` subfolder), the whole folder is removed with reason `torrent-leftover`. A folder holding any other file (for example a document or another non-sample video) is kept. `video-name` and `sample` removals count as duplicates found; `torrent-leftover` folders do not.
+
+### Near-Miss Video Name Report (`--report FILE`)
+
+To inspect video names that came close to matching but were not treated as duplicates (for example on large collections where 0 duplicates were found), use `--report FILE` (a path; works with every flag, including `--dry-run`):
+
+```bash
+python -m dedupe D:\Videos --dry-run --report near-miss.csv
+```
+
+- **Output format**: Writes a UTF-8 CSV with BOM (`utf-8-sig`, so Excel opens it cleanly) with columns: `file_a`, `file_b`, `title_a`, `title_b`, `score`, `blocked_by`.
+- **Contents**: One row per pair of video files that the video-names pass did not treat as duplicates and whose normalized title SequenceMatcher ratio is >= 0.5. Pairs that matched, and pairs below 0.5, are not listed.
+- **Blocking reasons (`blocked_by`)**: One of `below-threshold` (score < 0.85 and no guard fired), `year` (differing release years), `episode` (differing episode codes), or `number` (sequel/roman/vol/part/cd guard).
+- **Sorting and limits**: Rows are sorted by score (highest first), keeping at most the top 500 rows.
+- **Local file only**: The report is written locally and stays entirely on this PC; no file names ever leave this PC.
+- **Stderr summary**: Prints one line at the end: `Report: <path> (<n> near-miss pairs)` (suppressed under `--quiet`).
 
 ## Near-Duplicate Images, Documents and Videos (similar pass)
 

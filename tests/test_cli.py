@@ -90,5 +90,42 @@ class TestCLI(unittest.TestCase):
         self.assertIn("--cache-dir", help_text)
 
 
+    def test_parse_args_report(self):
+        args = parse_args(["some/path", "--report", "near-miss.csv"])
+        self.assertEqual(args.report, "near-miss.csv")
+
+    def test_report_csv_and_stderr(self):
+        import csv
+        vid_a = self.root / "a" / "The.Dark.Knight.2008.1080p.mkv"
+        vid_b = self.root / "b" / "Dark Knight 2008 720p.mp4"
+        vid_a.parent.mkdir(parents=True, exist_ok=True)
+        vid_b.parent.mkdir(parents=True, exist_ok=True)
+        vid_a.write_bytes(b"x" * 100)
+        vid_b.write_bytes(b"y" * 100)
+
+        report_path = self.root / "near-miss.csv"
+        err = io.StringIO()
+        with patch("sys.stderr", err):
+            ret = main([str(self.root), "--dry-run", "--report", str(report_path)])
+        self.assertEqual(ret, 0)
+        self.assertTrue(report_path.exists())
+        self.assertIn(f"Report: {report_path} (1 near-miss pairs)", err.getvalue())
+
+        with open(report_path, newline="", encoding="utf-8-sig") as f:
+            rows = list(csv.DictReader(f))
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["blocked_by"], "below-threshold")
+        self.assertTrue(0.5 <= float(rows[0]["score"]) < 0.85)
+
+    def test_report_quiet_suppresses_stderr_line(self):
+        report_path = self.root / "report.csv"
+        err = io.StringIO()
+        with patch("sys.stderr", err):
+            ret = main([str(self.root), "--dry-run", "--quiet", "--report", str(report_path)])
+        self.assertEqual(ret, 0)
+        self.assertTrue(report_path.exists())
+        self.assertEqual(err.getvalue(), "")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -20,7 +20,7 @@ from dedupe.similar import (
     default_workers,
     run_similar_pass,
 )
-from dedupe.video import run_video_pass
+from dedupe.video import run_video_pass, write_empty_report
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -114,6 +114,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Suppress progress output on stderr",
     )
+    parser.add_argument(
+        "--report",
+        default=None,
+        help="Write CSV report of near-miss video name pairs (local file)",
+    )
     return parser
 
 
@@ -140,6 +145,7 @@ def run_dedupe(
     workers: Optional[int] = None,
     cache_dir: Optional[Path | str] = None,
     no_cache: bool = False,
+    report: Optional[Path | str] = None,
 ) -> int:
     if workers is None:
         workers = default_workers()
@@ -167,6 +173,7 @@ def run_dedupe(
     trash_manager = TrashManager(root=root, dry_run=dry_run, permanent=permanent)
     all_removals: List[Removal] = []
     similar_matches: List[SimilarMatch] = []
+    near_miss_count = 0
 
     heartbeat = HeartbeatMonitor(progress)
     heartbeat.start()
@@ -227,11 +234,27 @@ def run_dedupe(
             removed_files = removed_files | fuzzy_removed
             progress.set_pass("video-names")
             heartbeat.begin("working on video-names")
-            video_removals, video_removed, _leftover = run_video_pass(root=root, trash_manager=trash_manager, removed_folders=removed_folders, removed_files=removed_files, dry_run=dry_run, permanent=permanent, inventory=inventory, progress=progress)
+            report_rows: Optional[List[dict]] = [] if report else None
+            video_removals, video_removed, _leftover = run_video_pass(
+                root=root,
+                trash_manager=trash_manager,
+                removed_folders=removed_folders,
+                removed_files=removed_files,
+                dry_run=dry_run,
+                permanent=permanent,
+                inventory=inventory,
+                progress=progress,
+                report=report,
+                report_rows_out=report_rows,
+            )
             heartbeat.end()
             all_removals.extend(video_removals)
             removed_files = removed_files | video_removed
             removed_folders = removed_folders | _leftover
+            if report_rows is not None:
+                near_miss_count = len(report_rows)
+        elif report:
+            write_empty_report(report)
 
         # Pass 4: near-duplicate images and documents, on this PC only
         if not no_similar:
@@ -310,6 +333,9 @@ def run_dedupe(
     )
 
     progress.done()
+    if report and not quiet:
+        sys.stderr.write(f"Report: {report} ({near_miss_count} near-miss pairs)\n")
+        sys.stderr.flush()
     return 0
 
 
@@ -331,4 +357,5 @@ def main(argv: List[str] | None = None) -> int:
         workers=args.workers,
         cache_dir=args.cache_dir,
         no_cache=args.no_cache,
+        report=args.report,
     )

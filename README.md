@@ -180,3 +180,25 @@ Pillow and pypdf are optional extras, declared as `similar` in `pyproject.toml` 
 - **`--min-match` Aggressiveness Warning**: The `--min-match` rule is aggressive because files sharing 10+ contiguous characters (e.g. `report_draft.xlsx` and `report_final.xlsx`) will be treated as fuzzy duplicates. Always run with `--dry-run` first. To be safer, raise `N` (e.g. `--min-match 25`) or use `--min-match 0` to disable the character-match rule.
 - **Recoverable by Default**: Removed files and folders are moved to `PATH\_dedupe_trash\<YYYYMMDD-HHMMSS>\` relative to `PATH`. To restore any item, simply move it back to its original relative location.
 - **Permanent Deletion Warning**: When `--permanent` is supplied, files are deleted permanently and directories removed with `rmtree`. No trash folder is created. Use with caution.
+
+## Install on Windows
+
+The window app needs no administrator rights and sends nothing off this PC.
+
+1. Build or receive `Dedupe-Setup.zip` (see "Build the installer" below).
+2. Unzip `Dedupe-Setup.zip` to any folder.
+3. Double-click `Install.cmd`. It installs per-user to `%LOCALAPPDATA%\Programs\Dedupe`, creates a Desktop shortcut and a Start Menu shortcut (both run `pythonw.exe -m dedupe.gui`), and writes a `dedupe.cmd` launcher in the install folder.
+4. Double-click the Desktop **Dedupe** shortcut and pick a folder, or drag a folder onto the shortcut to open the app with that folder filled in.
+5. To uninstall, open **Settings > Apps** and uninstall **Dedupe**, or run `uninstall.ps1` from the install folder (`%LOCALAPPDATA%\Programs\Dedupe\uninstall.ps1`).
+
+You can also run the window app from source with `python -m dedupe.gui [folder]`.
+
+## Build the installer
+
+From the repo root, run:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File packaging\build.ps1
+```
+
+This writes `dist\Dedupe-Setup.zip` containing `Install.cmd`, `install.ps1`, `uninstall.ps1`, `README-INSTALL.txt` and the app source under `app\dedupe\`. No compiling is involved; the app runs on the signed `python.exe`/`pythonw.exe` from python.org.

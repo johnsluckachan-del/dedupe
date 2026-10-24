@@ -1,6 +1,6 @@
 # dedupe
 
-A command-line tool to scan a folder recursively and safely remove duplicate folders, exact duplicate files, and fuzzy-name duplicate files. Built with Python 3.12 standard library only (no third-party dependencies).
+A command-line tool to scan a folder recursively and safely remove duplicate folders, exact duplicate files, fuzzy-name duplicate files, torrent video duplicates, and near-duplicate images and documents. Built with the Python 3.12 standard library; only the near-duplicate image/PDF readers are optional third-party extras, and everything runs on this PC with no network use.
 
 ## Key Features
 
@@ -42,6 +42,8 @@ python -m dedupe PATH [options]
 ```text
 usage: dedupe [-h] [--dry-run] [--permanent] [--no-fuzzy] [--quiet]
               [--threshold THRESHOLD] [--min-match MIN_MATCH]
+              [--no-similar] [--review] [--delete-similar]
+              [--image-distance N] [--text-similarity R]
               path
 
 positional arguments:
@@ -57,6 +59,16 @@ options:
   --min-match MIN_MATCH
                         Minimum common substring length in normalized stems
                         for fuzzy matching (default: 10; 0 disables)
+  --no-similar          Skip the similar pass (near-duplicate images and
+                        documents)
+  --review              List near-duplicates as SIMILAR lines instead of
+                        removing them
+  --delete-similar      Remove near-duplicates (the default; accepted for
+                        compatibility)
+  --image-distance N    Max dHash Hamming distance for similar images
+                        (default: 6)
+  --text-similarity R   Min shingle Jaccard for similar documents
+                        (default: 0.9)
   --quiet               Suppress progress output on stderr
 ```
 
@@ -64,7 +76,7 @@ options:
 
 ## Progress Output
 
-Progress is printed to stderr (stdout keeps only the removal lines and summary). The first line is `Scanning <path> ...`, printed and flushed immediately. While walking and hashing, a status line is printed at most every 2 seconds; one status line is always printed at the end of each pass (`walk`, `folder`, `exact`, `fuzzy`). Every status line shows both running counters plus the current pass name, for example `[exact] 12,345 files scanned, 37 duplicates found`. `files scanned` counts every file found by the walk (including zero-byte files; `_dedupe_trash` and symlinks/junctions excluded) and `duplicates found` counts removals planned or done so far (one per duplicate folder, one per duplicate file; never goes down). The last stderr line shows the elapsed time with the final totals, for example `Done in 1.23s: 12,345 files scanned, 37 duplicates found`. Use `--quiet` to suppress all progress output on stderr (errors are still printed to stderr).
+Progress is printed to stderr (stdout keeps only the removal lines and summary). The first line is `Scanning <path> ...`, printed and flushed immediately. While walking and hashing, a status line is printed at most every 2 seconds; one status line is always printed at the end of each pass (`walk`, `folder`, `exact`, `fuzzy`, `video-names`, `similar`). Every status line shows both running counters plus the current pass name, for example `[exact] 12,345 files scanned, 37 duplicates found`. `files scanned` counts every file found by the walk (including zero-byte files; `_dedupe_trash` and symlinks/junctions excluded) and `duplicates found` counts removals planned or done so far (one per duplicate folder, one per duplicate file; never goes down). The last stderr line shows the elapsed time with the final totals, for example `Done in 1.23s: 12,345 files scanned, 37 duplicates found, 4 similar found`, where `similar found` counts the near-duplicates from the similar pass (see below) whether or not they were removed. Use `--quiet` to suppress all progress output on stderr (errors are still printed to stderr).
 
 The tree is walked once and files are hashed lazily through a shared cache: each file is hashed at most once per run, and a file whose size is unique among non-empty files is never hashed. Note that the first run on a big network share still reads every file that has a same-size twin.
 
@@ -91,6 +103,8 @@ The walk reads size and modification time straight from the directory listing (n
    - Matches are transitive: files are grouped using union-find.
    - Keeper selection: one file is kept per group (a file with no copy marker in its name, then newest modification time (`mtime`), then shortest name, then alphabetical order). The printed reason for removals is `fuzzy`.
 
+4. **Pass 4 - Near-Duplicate Images and Documents**: see [Near-Duplicate Images and Documents](#near-duplicate-images-and-documents-similar-pass) below. Skipped if `--no-similar` is specified; `--review` lists instead of removing.
+
 ---
 
 ## Torrent Video Duplicates (video-names pass)
@@ -111,6 +125,31 @@ Examples of what never matches:
 - Different movies whose parsed titles are not similar enough (ratio below 0.85).
 
 Samples and leftovers: a video with the token `sample` (or inside a `Sample` folder) that is under 1/10 of the size of a non-sample video in the same torrent folder (or its parent) is removed with reason `sample`. After a video is removed, if its torrent folder (its parent, not the scan root) holds only junk (`.nfo .txt .jpg .jpeg .png .srt .sub .idx .ass .url .sfv .md5 .exe .lnk` files, sample videos, empty folders, or a `Subs`/`Sample` subfolder), the whole folder is removed with reason `torrent-leftover`. A folder holding any other file (for example a document or another non-sample video) is kept. `video-name` and `sample` removals count as duplicates found; `torrent-leftover` folders do not.
+
+## Near-Duplicate Images and Documents (similar pass)
+
+Pass 4 runs after the video-names pass, on the files that survived passes 1-3, and finds the near-duplicates that byte-for-byte matching misses: a photo saved again at a smaller size or a lower JPEG quality, a document edited after a copy was filed elsewhere. It runs **entirely on this PC**: no cloud service, no API key, and no network use of any kind. It never prompts and never reads stdin.
+
+Near-duplicates are **removed by default**, exactly like any other duplicate: trash by default, `--permanent` and `--dry-run` respected, with reason `similar-image` or `similar-document`. They count in `duplicates found`. `--delete-similar` asks for that default explicitly and changes nothing.
+
+- **Images** (`.jpg .jpeg .png .bmp .gif .webp .tif .tiff`, any case): a 64-bit perceptual difference hash (dHash — grayscale, resized to 9x8, each pixel compared with its right neighbour) via Pillow. Two images are near-duplicates when the Hamming distance between their hashes is at most `--image-distance` (default `6`), compared across the whole tree. Candidates come from splitting each hash into 8 bands of 8 bits and only comparing images that share a whole band, so nothing is compared with everything (any pair within distance 7 must share a band). Keeper: most pixels, then biggest file, then the pass-2 keeper rule.
+- **Documents** (`.txt .md .csv .docx .pdf`): text is extracted locally (`.docx` from `word/document.xml` with `zipfile` + `xml.etree`; `.pdf` with `pypdf` when it is installed), lowercased, whitespace-collapsed and split into words, reading at most the first 2 MB of text. Similarity is the Jaccard overlap of 5-word shingles, and documents are near-duplicates at `--text-similarity` or above (default `0.9`). Candidates come from MinHash + LSH banding and are confirmed with the real Jaccard. Only documents with the **same extension** are compared — `plan.txt` and `plan.docx` are an intentional export, never a duplicate. Documents under 50 words are skipped. Keeper: newest modification time, then biggest file.
+- An image is never compared with a document. Unreadable, truncated or corrupt files are skipped silently. Groups are formed with union-find and keep exactly one file each.
+
+### Reviewing instead of removing
+
+`--review` lists the near-duplicates on stdout and removes **none** of them — one line per near-duplicate, holding the near-duplicate path, the kept path, the kind and the score:
+
+```text
+SIMILAR: phone\small copy.jpg ~ camera\IMG_A.png (image, distance 0)
+SIMILAR: old\report.docx ~ new\report v2.docx (document, similarity 0.96)
+```
+
+### Cost and optional packages
+
+This pass **reads every image and document** that survived the earlier passes, so it is slow on a big network share. `--no-similar` skips it entirely. A status line is printed when the pass ends, and the final `Done` line also reports how many near-duplicates were found (whether or not they were removed), for example `Done in 3.2s: 50 files scanned, 3 duplicates found, 1 similar found`.
+
+Pillow and pypdf are optional extras, declared as `similar` in `pyproject.toml` (`pip install -e .[similar]`). If one is missing, one warning is printed to stderr (for example `image similarity skipped: Pillow not installed`) and the rest of the run carries on. Everything else is Python standard library.
 
 ## Safety Notes
 

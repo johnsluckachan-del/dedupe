@@ -11,6 +11,12 @@ from dedupe.core import HashCache, HeartbeatMonitor, ProgressReporter, Removal, 
 from dedupe.exact import run_exact_pass
 from dedupe.folder import run_folder_pass
 from dedupe.fuzzy import run_fuzzy_pass
+from dedupe.similar import (
+    DEFAULT_IMAGE_DISTANCE,
+    DEFAULT_TEXT_SIMILARITY,
+    SimilarMatch,
+    run_similar_pass,
+)
 from dedupe.video import run_video_pass
 
 
@@ -51,6 +57,33 @@ def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
         help="Minimum common substring length in normalized stems for fuzzy matching (default: 10; 0 disables)",
     )
     parser.add_argument(
+        "--no-similar",
+        action="store_true",
+        help="Skip the similar pass (near-duplicate images and documents)",
+    )
+    parser.add_argument(
+        "--review",
+        action="store_true",
+        help="List near-duplicates as SIMILAR lines instead of removing them",
+    )
+    parser.add_argument(
+        "--delete-similar",
+        action="store_true",
+        help="Remove near-duplicates (the default; accepted for compatibility)",
+    )
+    parser.add_argument(
+        "--image-distance",
+        type=int,
+        default=DEFAULT_IMAGE_DISTANCE,
+        help=f"Max dHash Hamming distance for similar images (default: {DEFAULT_IMAGE_DISTANCE})",
+    )
+    parser.add_argument(
+        "--text-similarity",
+        type=float,
+        default=DEFAULT_TEXT_SIMILARITY,
+        help=f"Min shingle Jaccard for similar documents (default: {DEFAULT_TEXT_SIMILARITY})",
+    )
+    parser.add_argument(
         "--quiet",
         action="store_true",
         help="Suppress progress output on stderr",
@@ -66,6 +99,10 @@ def run_dedupe(
     threshold: float = 0.9,
     min_match: int = 10,
     quiet: bool = False,
+    no_similar: bool = False,
+    review: bool = False,
+    image_distance: int = DEFAULT_IMAGE_DISTANCE,
+    text_similarity: float = DEFAULT_TEXT_SIMILARITY,
 ) -> int:
     progress = ProgressReporter(quiet=quiet)
     progress.start(target_path)
@@ -80,6 +117,7 @@ def run_dedupe(
 
     trash_manager = TrashManager(root=root, dry_run=dry_run, permanent=permanent)
     all_removals: List[Removal] = []
+    similar_matches: List[SimilarMatch] = []
 
     heartbeat = HeartbeatMonitor(progress)
     heartbeat.start()
@@ -143,21 +181,51 @@ def run_dedupe(
             video_removals, video_removed, _leftover = run_video_pass(root=root, trash_manager=trash_manager, removed_folders=removed_folders, removed_files=removed_files, dry_run=dry_run, permanent=permanent, inventory=inventory, progress=progress)
             heartbeat.end()
             all_removals.extend(video_removals)
+            removed_files = removed_files | video_removed
+            removed_folders = removed_folders | _leftover
+
+        # Pass 4: near-duplicate images and documents, on this PC only
+        if not no_similar:
+            heartbeat.begin("working on similar")
+            similar_removals, _similar_removed, similar_matches = run_similar_pass(
+                root=root,
+                trash_manager=trash_manager,
+                removed_folders=removed_folders,
+                removed_files=removed_files,
+                dry_run=dry_run,
+                permanent=permanent,
+                review=review,
+                image_distance=image_distance,
+                text_similarity=text_similarity,
+                inventory=inventory,
+                progress=progress,
+                quiet=quiet,
+            )
+            heartbeat.end()
+            all_removals.extend(similar_removals)
     finally:
         heartbeat.stop()
 
+    def rel(path: Path) -> Path:
+        try:
+            return path.relative_to(root)
+        except ValueError:
+            return path
+
     # Print one line per removal: action, removed path, kept path, reason
     for r in all_removals:
-        try:
-            rel_removed = r.removed_path.relative_to(root)
-        except ValueError:
-            rel_removed = r.removed_path
-        try:
-            rel_kept = r.kept_path.relative_to(root)
-        except ValueError:
-            rel_kept = r.kept_path
+        print(
+            f"{r.action}: {rel(r.removed_path)} "
+            f"(kept: {rel(r.kept_path)}, reason: {r.reason})"
+        )
 
-        print(f"{r.action}: {rel_removed} (kept: {rel_kept}, reason: {r.reason})")
+    # --review: list the near-duplicates instead of removing them
+    if review:
+        for m in similar_matches:
+            print(
+                f"SIMILAR: {rel(m.removed_path)} ~ {rel(m.kept_path)} "
+                f"({m.kind}, {m.score_text})"
+            )
 
     # Summary
     folder_count = sum(1 for r in all_removals if r.reason == "folder")
@@ -167,13 +235,21 @@ def run_dedupe(
     sample_count = sum(1 for r in all_removals if r.reason == "sample")
     leftover_count = sum(1 for r in all_removals if r.reason == "torrent-leftover")
     video_summary_extra = f", {video_count} video-name, {sample_count} sample, {leftover_count} torrent-leftover" if (video_count or sample_count or leftover_count) else ""
+    similar_image_count = sum(1 for r in all_removals if r.reason == "similar-image")
+    similar_doc_count = sum(1 for r in all_removals if r.reason == "similar-document")
+    similar_summary_extra = (
+        f", {similar_image_count} similar-image, {similar_doc_count} similar-document"
+        if (similar_image_count or similar_doc_count)
+        else ""
+    )
     total_count = len(all_removals)
     total_bytes = sum(r.bytes_freed for r in all_removals)
 
     action_word = "would be removed" if dry_run else "removed"
     print(
         f"Summary: {total_count} items {action_word} "
-        f"({folder_count} folder, {exact_count} exact, {fuzzy_count} fuzzy{video_summary_extra}), "
+        f"({folder_count} folder, {exact_count} exact, {fuzzy_count} fuzzy"
+        f"{video_summary_extra}{similar_summary_extra}), "
         f"{total_bytes} bytes freed"
     )
 
@@ -191,4 +267,8 @@ def main(argv: List[str] | None = None) -> int:
         threshold=args.threshold,
         min_match=args.min_match,
         quiet=args.quiet,
+        no_similar=args.no_similar,
+        review=args.review,
+        image_distance=args.image_distance,
+        text_similarity=args.text_similarity,
     )

@@ -102,6 +102,7 @@ class ProgressReporter:
         self.total_bytes = 0
         self.files_hashed = 0
         self.duplicates_found = 0
+        self.similar_found = 0
         self.current_pass = "walk"
         self._overwrote = False
         self._write_lock = threading.Lock()
@@ -164,6 +165,11 @@ class ProgressReporter:
     def add_duplicates(self, count: int = 1) -> None:
         self.note_duplicate(count)
 
+    def note_similar(self, count: int = 1) -> None:
+        """Near-duplicates found by the similar pass, removed or only listed."""
+        self.similar_found += count
+        self.maybe_status()
+
     def maybe_status(self, force: bool = False) -> None:
         if self.quiet:
             return
@@ -180,7 +186,8 @@ class ProgressReporter:
         self._overwrote = False
         self._write(
             f"Done in {elapsed:.2f}s: {self.files_found:,} files scanned, "
-            f"{self.duplicates_found:,} duplicates found\n"
+            f"{self.duplicates_found:,} duplicates found, "
+            f"{self.similar_found:,} similar found\n"
         )
 
     def heartbeat(self, label: str, elapsed: float) -> None:
